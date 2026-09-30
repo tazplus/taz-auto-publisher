@@ -227,25 +227,28 @@ def _vlen(s):
     return len(re.sub(r"<[^>]+>", "", s))
 
 def build_caption(name, version, cap, footer, size=0):
-    """يبني منشوراً عربياً كاملاً ضمن حدّ تلقرام. يرمي TransientError لو تعذّر التعريب."""
+    """يبني منشوراً عربياً كاملاً ضمن حدّ تلقرام، مع تهريب رموز HTML (<,>,&) بأمان.
+    يرمي TransientError لو تعذّر التعريب (فلا ننشر شيئاً ناقصاً)."""
     o = _gemini_localize(name, cap)
-    title = "✨ " + str(o["name"]).strip()
+    esc = html.escape                                   # يمنع رفض تلقرام لأي < أو > أو &
+    title = "✨ " + esc(str(o["name"]).strip())
     desc = str(o["desc"]).strip()
-    if _vlen(desc) > 400:                      # وصف طويل جداً → قصّه بأمان
+    if len(desc) > 400:                                 # وصف طويل جداً → قصّه بأمان
         desc = desc[:400].rstrip() + "…"
-    tail_ver = "📱 الإصدار: " + (version or "—")
+    desc = esc(desc)
+    tail_ver = "📱 الإصدار: " + esc(version or "—")
     # الأجزاء الثابتة (عنوان + وصف + عنوان المميزات + الإصدار + الخاتمة) لها الأولوية
     fixed = "\n".join([title, "", desc, "", "🔹 المميزات:", "", tail_ver, "", CLOSER])
     budget = CAPTION_LIMIT - _vlen(fixed)
-    feats = []
+    feats, used = [], 0
     for f in (o.get("features") or [])[:6]:
         f = str(f).strip().lstrip("•-*·").strip()
         if not f:
             continue
-        line = "• " + f
-        if _vlen("\n".join(feats + [line])) > budget:   # لا تتجاوز المتبقّي
+        raw = "• " + f                                  # القياس على النص الخام (الطول المرئي)
+        if used + len(raw) + 1 > budget:
             break
-        feats.append(line)
+        feats.append("• " + esc(f)); used += len(raw) + 1
     parts = [title, "", desc, "", "🔹 المميزات:"]
     if feats:
         parts.append("\n".join(feats))
