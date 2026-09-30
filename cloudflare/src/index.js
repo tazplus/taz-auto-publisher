@@ -1300,11 +1300,22 @@ export default {
     if (url.pathname === '/alert' && request.method === 'POST') {
       if (request.headers.get('x-secret') !== env.ENQUEUE_SECRET) return new Response('forbidden', { status: 403 });
       const b = await readJson();
-      if (b && b.msg) await notifyOwners(env, String(b.msg));
+      if (b && b.msg) {
+        // منع تكرار: نفس التنبيه خلال 30 دقيقة يُتجاهل (يمنع إغراق المالك عند عطل مستمر)
+        const msg = String(b.msg);
+        const sig = msg.slice(0, 120);
+        const prev = await getSetting(env, 'alert_last', '');
+        const prevTs = parseInt(await getSetting(env, 'alert_last_ts', '0'), 10) || 0;
+        if (!(prev === sig && (nowSec() - prevTs) < 1800)) {
+          await setSetting(env, 'alert_last', sig);
+          await setSetting(env, 'alert_last_ts', String(nowSec()));
+          await notifyOwners(env, msg);
+        }
+      }
       return Response.json({ ok: true });
     }
 
-    // مصدر تلقرام (@AbodSyripa): كل ما يحتاجه القارئ في نداء واحد + تحديث آخر رسالة معالَجة
+    // مصدر التطبيقات (@blatants): كل ما يحتاجه القارئ في نداء واحد + تحديث آخر رسالة معالَجة
     if (url.pathname === '/tgsource') {
       if (request.headers.get('x-secret') !== env.ENQUEUE_SECRET) return new Response('forbidden', { status: 403 });
       if (request.method === 'POST') {
@@ -1345,6 +1356,7 @@ export default {
         gemini_key: env.GEMINI_API_KEY || '',   // مفتاح التعريب (سرّ الووركر) — يصل للقارئ المصرّح فقط
         backfill: (await getSetting(env, 'tg_backfill', '0')) === '1',   // السحب التدريجي مفعّل؟
         back_days: parseInt(await getSetting(env, 'tg_back_days', '90'), 10) || 90,
+        stats_due: (nowSec() - (parseInt(await getSetting(env, 'stats_last_ts', '0'), 10) || 0)) >= 3300,  // جمع التحليلات كل ساعة
         groups,
       });
     }
@@ -1360,6 +1372,7 @@ export default {
       hist.push({ d: day, v: Number(b.views) || 0, r: Number(b.reactions) || 0, p: Number(b.posts) || 0 });
       hist = hist.slice(-30);
       await setSetting(env, 'views_history', JSON.stringify(hist));
+      await setSetting(env, 'stats_last_ts', String(nowSec()));   // آخر تحديث تحليلات (للتقييد الساعي)
       return Response.json({ ok: true });
     }
 

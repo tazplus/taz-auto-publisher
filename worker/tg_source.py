@@ -76,6 +76,11 @@ async def collect_stats(client, ident):
     day_start = datetime.now(ksa).replace(hour=0, minute=0, second=0, microsecond=0)
     day_str = day_start.strftime("%Y-%m-%d")
     start_ts = day_start.timestamp()
+    # تطبيع المعرّف: @username كما هو، والرقم (-100…) يُحوّل int ليحلّه تيليثون
+    s = str(ident).strip()
+    if s and not s.startswith("@"):
+        try: ident = int(s)
+        except ValueError: ident = s
     ent = await client.get_entity(ident)
     views = reactions = posts = 0
     async for m in client.iter_messages(ent, limit=400):
@@ -394,8 +399,8 @@ async def _run():
     cfg_base = telegram.cfg_from_env()
 
     async with TelegramClient(StringSession(sess), api_id, api_hash) as client:
-        # 📊 تحليلات القناة (مشاهدات/تفاعلات/منشورات اليوم) — تعمل حتى لو النشر موقوف
-        if stats_ident:
+        # 📊 تحليلات القناة (مشاهدات/تفاعلات/منشورات اليوم) — كل ساعة، وتعمل حتى لو النشر موقوف
+        if stats_ident and st.get("stats_due", True):
             try:
                 await collect_stats(client, stats_ident)
             except Exception as e:
