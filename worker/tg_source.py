@@ -12,7 +12,7 @@ Env:
   DYLIB_PATH                                           # دايلب احتياطي
   STRIP_DYLIBS = 3BodSyPatch.dylib                     # بصمة المصدر (تُشال)
 """
-import os, re, sys, html, tempfile, shutil, traceback, struct, zlib, zipfile, glob, asyncio, requests
+import os, re, sys, html, json, random, tempfile, shutil, traceback, struct, zlib, zipfile, glob, asyncio, requests
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 from telethon.tl.types import MessageMediaDocument, DocumentAttributeFilename
@@ -114,9 +114,78 @@ def clean_desc(cap, name=""):
     return "\n".join(out)
 
 
+# ---- التعريب الذكي (جيمناي) — بأمانة تامة: يعرّب المذكور فقط، ما يخترع ولا يزيد ولا يعدّل ----
+GEMINI_MODELS = ["gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash",
+                 "gemini-3.5-flash", "gemini-flash-latest"]
+
+# عبارة ختامية واحدة موحّدة لكل التطبيقات (من عبارتَي المالك؛ لتبديلها بدّل السطر فقط)
+CLOSER = "نقدّر دعمكم لتطبيقات تاز، وتفاعلكم يصنع الفرق. 🤍"
+# البديل المعتمد الآخر: "شكرًا لدعم تطبيقات تاز، وتفاعلكم محل تقديرنا. 🤍"
+
+
+class TransientError(Exception):
+    """عطل مؤقّت (جيمناي/شبكة/مخ) — نوقف الدفعة بلا تقديم المؤشّر ونعيد لاحقاً، لا نخسر التطبيق."""
+    pass
+
+
+def _gemini_localize(name, cap):
+    """يرجّع dict{name,desc,features[]} معرّب بأمانة. يرمي TransientError عند تعذّر التعريب."""
+    key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if not key:
+        raise TransientError("مفتاح جيمناي مفقود (GEMINI_API_KEY) — التعريب متوقّف")
+    src = (cap or name or "").strip()
+    prompt = (
+        "أنت كاتب محتوى عربي فاخر لقناة تطبيقات آيفون اسمها «تاز بلس».\n"
+        "هذه معلومات تطبيق كما وردت من المصدر:\n---\n" + src + "\n---\n"
+        "المطلوب بأمانة تامة وبدون أي اختراع أو مبالغة أو تعديل:\n"
+        "1) name: اسم التطبيق النظيف المختصر بالإنجليزي فقط — بدون رقم الإصدار وبدون "
+        "كلمات مثل Unlocked/Patched/Premium/Mod/blatant وبدون شرطات سفلية أو رموز.\n"
+        "2) desc: وصف عربي فاخر قصير جداً (سطر إلى سطرين) لوظيفة التطبيق، مبني على المعلومات "
+        "المذكورة فقط لا غير.\n"
+        "3) features: عرّب للعربية المميزات/التغييرات المذكورة في نص المصدر بأسلوب جذاب ومهذّب. "
+        "ممنوع تماماً اختراع أي ميزة غير مذكورة، وممنوع الزيادة من عندك، وممنوع تعديل أو تضخيم "
+        "أي ميزة. إذا لم يذكر المصدر مميزات واضحة فاكتب من 2 إلى 3 نقاط واقعية موجزة تصف وظيفة "
+        "التطبيق الأساسية فقط بلا مبالغة.\n"
+        "ممنوع أي كلمة إنجليزية في المخرجات عدا حقل name. أعِد JSON فقط بالحقول: name, desc, features."
+    )
+    body = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"responseMimeType": "application/json", "temperature": 0.7},
+    }
+    last = ""
+    for m in GEMINI_MODELS:
+        for attempt in range(2):
+            try:
+                r = requests.post(
+                    "https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent" % m,
+                    headers={"x-goog-api-key": key, "Content-Type": "application/json"},
+                    json=body, timeout=45)
+                if r.status_code in (429, 500, 503):      # ضغط/مؤقّت → أعد أو بدّل الموديل
+                    last = "HTTP %s" % r.status_code; continue
+                d = r.json()
+                parts = d["candidates"][0]["content"]["parts"]
+                txt = next((p["text"] for p in parts
+                            if str(p.get("text", "")).strip().startswith("{")),
+                           parts[-1].get("text", ""))
+                o = json.loads(txt)
+                if o.get("name") and o.get("desc"):
+                    return o
+                last = "رد ناقص"
+            except Exception as e:
+                last = str(e)[:90]; print("[gemini] %s: %s" % (m, last)); continue
+    raise TransientError("تعذّر التعريب عبر كل موديلات جيمناي — آخر سبب: " + last)
+
+
 def build_caption(name, version, cap, footer, size=0):
-    info = {"name": name, "version": version, "description": clean_desc(cap, name), "size": size}
-    return worker.build_caption(info, footer=footer)
+    """يبني منشوراً عربياً كاملاً. يرمي TransientError لو تعذّر التعريب (فلا ننشر شيئاً ناقصاً)."""
+    o = _gemini_localize(name, cap)
+    lines = ["✨ " + str(o["name"]).strip(), "", str(o["desc"]).strip(), "", "🔹 المميزات:"]
+    for f in (o.get("features") or [])[:6]:
+        f = str(f).strip().lstrip("•-*·").strip()
+        if f:
+            lines.append("• " + f)
+    lines += ["", "📱 الإصدار: " + (version or "—"), "", CLOSER]
+    return "\n".join(lines)
 
 
 # ---- استخراج أيقونة التطبيق من الـIPA (تظهر كصورة مصغّرة على المنشور) ----
@@ -191,6 +260,8 @@ async def _process_one(client, m, kind, cfg_base, groups, reactions, footer):
     if size > worker.TG_MAX_BYTES:
         brain_alert(f"⚠️ <b>تطبيق كبير وتخطّيناه</b>\nالتطبيق: {name}\nالسبب: أكبر من حد تلقرام (٢ جيجا).")
         print(f"[skip] {name}: أكبر من حد تلقرام"); return "skip"
+    # عرّب أولاً قبل التنزيل — لو تعذّر التعريب نوقف فوراً بلا تنزيل ولا ننشر شيئاً ناقصاً
+    caption = build_caption(name, version, cap, footer, size=size)   # يرمي TransientError عند العطل
     workdir = tempfile.mkdtemp(prefix="tg_")
     try:
         raw = os.path.join(workdir, "raw.ipa")
@@ -203,18 +274,17 @@ async def _process_one(client, m, kind, cfg_base, groups, reactions, footer):
             norm = []
             for c in (g.get("channels") or []):
                 if isinstance(c, dict):
-                    cid = c.get("id"); ft = c.get("footer") if c.get("footer") not in (None, "") else footer
+                    cid = c.get("id")
                 else:
-                    cid, ft = c, footer
+                    cid = c
                 if cid:
-                    norm.append((cid, ft))
+                    norm.append(cid)
             if not norm:
                 continue
             dylib_path = fetch_dylib(g.get("dylib") or "")
             out = worker.inject_app(raw, info, dylib_path, workdir)   # يحقن + يشيل STRIP_DYLIBS
             try:
-                targets = [{"chan": cid, "caption": build_caption(name, version, cap, ft, size=size)}
-                           for (cid, ft) in norm]
+                targets = [{"chan": cid, "caption": caption} for cid in norm]
                 cfg = dict(cfg_base); cfg["targets"] = targets; cfg["reactions"] = reactions
                 await telegram._publish(cfg, out, targets[0]["caption"], thumb)   # نفس الحلقة
                 published_any = True
@@ -234,6 +304,10 @@ async def _process_one(client, m, kind, cfg_base, groups, reactions, footer):
 
 async def _run():
     st = brain_get()
+    # مفتاح التعريب يصل من المخ (سرّ الووركر) — نحقنه بالبيئة بلا طباعة
+    gk = (st.get("gemini_key") or "").strip()
+    if gk and not os.environ.get("GEMINI_API_KEY"):
+        os.environ["GEMINI_API_KEY"] = gk
     if not st.get("enabled", True):
         print("مصدر تلقرام موقوف"); return
     limit = int(st.get("limit", 4) or 4)
@@ -282,6 +356,9 @@ async def _run():
                 brain_set_state(last_id=m.id)   # تخطَّ فوراً (لا تعليق ولا إعادة)
                 brain_alert(f"⚠️ <b>تطبيق تأخّر وتخطّيناه</b>\nالسبب: تجاوز المهلة ({PER_APP_TIMEOUT//60} دقيقة) — غالباً كبير أو الشبكة بطيئة.\n(المصدر: رسالة {m.id})")
                 print(f"[timeout] tg{m.id} skipped")
+            except TransientError as e:   # عطل مؤقّت → أوقف بلا تقديم المؤشّر (نعيد لاحقاً، ما نخسر التطبيق)
+                brain_alert(f"⛔️ <b>توقّفت الدفعة مؤقّتاً</b>\nالسبب: {str(e)[:170]}\nلن نخسر أي تطبيق — سنعيد المحاولة تلقائياً بالجولة القادمة.")
+                print(f"[transient] paused at tg{m.id}: {str(e)[:150]}"); return
             except BaseException as e:
                 brain_set_state(last_id=m.id)   # تخطَّ فوراً، لا نعلّق ولا نعيد نفس التطبيق
                 brain_alert(f"⚠️ <b>تطبيق فشل وتخطّيناه</b>\nالسبب: {str(e)[:150]}\n(المصدر: رسالة {m.id})")
@@ -299,6 +376,9 @@ async def _run():
                 brain_set_state(back_id=m.id)
                 brain_alert(f"⚠️ <b>تطبيق قديم تأخّر وتخطّيناه</b>\nالسبب: تجاوز المهلة ({PER_APP_TIMEOUT//60} دقيقة).\n(المصدر: رسالة {m.id})")
                 print(f"[timeout back] tg{m.id} skipped")
+            except TransientError as e:   # عطل مؤقّت → أوقف بلا تقديم مؤشّر الباكفل
+                brain_alert(f"⛔️ <b>توقّف الباكفل مؤقّتاً</b>\nالسبب: {str(e)[:170]}\nلن نخسر أي تطبيق — سنعيد المحاولة تلقائياً بالجولة القادمة.")
+                print(f"[transient back] paused at tg{m.id}: {str(e)[:150]}"); return
             except BaseException as e:
                 brain_set_state(back_id=m.id)
                 brain_alert(f"⚠️ <b>تطبيق قديم فشل وتخطّيناه</b>\nالسبب: {str(e)[:150]}\n(المصدر: رسالة {m.id})")
@@ -307,7 +387,16 @@ async def _run():
 
 
 def run():
-    asyncio.run(_run())
+    # درع عام: أي خطأ غير متوقّع بكامل التشغيل (دخول تلقرام/الجلسة/المخ/الشبكة) → تنبيه فوري للمالك
+    try:
+        asyncio.run(_run())
+    except BaseException as e:
+        try:
+            brain_alert(f"🚨 <b>عطل عام في القارئ</b>\nالسبب: {str(e)[:200]}\nتوقّفت هذه الجولة — لم يُنشر شيء ناقص، وسنعيد تلقائياً بالجولة القادمة.")
+        except Exception:
+            pass
+        traceback.print_exc()
+        raise
 
 
 if __name__ == "__main__":

@@ -1249,6 +1249,7 @@ export default {
         limit: parseInt(await getSetting(env, 'tg_source_limit', '4'), 10) || 4,   // كم تطبيق كحد أقصى لكل تشغيل
         footer: await getSetting(env, 'footer', ''),
         reactions: await getSetting(env, 'reactions', '🔥,❤️'),
+        gemini_key: env.GEMINI_API_KEY || '',   // مفتاح التعريب (سرّ الووركر) — يصل للقارئ المصرّح فقط
         groups,
       });
     }
@@ -1299,7 +1300,7 @@ export default {
       return Response.json({ ok: true });
     }
 
-    if (url.pathname === '/') return new Response('ahmad-auto-publisher: alive');
+    if (url.pathname === '/') return new Response('taz-auto-publisher: alive');
     return new Response('not found', { status: 404 });
   },
 
