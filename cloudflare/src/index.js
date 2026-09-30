@@ -6,7 +6,7 @@
  * - يمنع تكرار نفس التطبيق أكثر من مرة باليوم
  *
  * أسرار (wrangler secret): TG_BOT_TOKEN, OWNER_ID, GH_TOKEN, GH_REPO (owner/name),
- *   ENQUEUE_SECRET, AHMAD_WEBHOOK_SECRET
+ *   ENQUEUE_SECRET
  */
 
 const KSA_OFFSET = 3 * 3600; // توقيت السعودية UTC+3
@@ -35,8 +35,8 @@ function arErr(msg) {
   if (/two different IP|authorization key/i.test(m)) return 'الجلسة استُخدمت من مكانين معاً (سيُعاد لاحقاً)';
   if (/not an IPA/i.test(m)) return 'الملف المحمّل ليس تطبيقاً سليماً';
   if (/truncated/i.test(m)) return 'التحميل انقطع قبل اكتماله';
-  if (/login failed/i.test(m)) return 'تعذّر تسجيل الدخول لموقع أحمد';
-  if (/not found in recent/i.test(m)) return 'التطبيق ما عاد موجوداً بقائمة أحمد';
+  if (/login failed/i.test(m)) return 'تعذّر تسجيل الدخول للمصدر';
+  if (/not found in recent/i.test(m)) return 'التطبيق ما عاد موجوداً بقائمة المصدر';
   if (/inject|lief|dylib/i.test(m)) return 'تعذّر حقن الإضافة بالتطبيق';
   if (/timed? ?out|timeout/i.test(m)) return 'انتهت المهلة (الملف كبير أو الشبكة بطيئة)';
   if (/connection|network|resolve|ECONN|SSL|certificate/i.test(m)) return 'انقطاع بالاتصال أثناء التحميل';
@@ -78,7 +78,7 @@ async function dispatchWorker(env, app, footer, groups) {
     headers: {
       'Authorization': `Bearer ${env.GH_TOKEN}`,
       'Accept': 'application/vnd.github+json',
-      'User-Agent': 'ahmad-auto-publisher',
+      'User-Agent': 'taz-auto-publisher',
       'content-type': 'application/json',
     },
     body: JSON.stringify({ event_type: 'publish_app', client_payload: {
@@ -1070,7 +1070,7 @@ async function maybeHealthCheck(env) {
   if (since < 6 * 3600) return;                                             // نُشر مؤخراً = تمام
   if (await getSetting(env, 'health_alerted', '0') === '1') return;         // نبّهنا مسبقاً
   await setSetting(env, 'health_alerted', '1');
-  await notifyOwners(env, `🔴 <b>تنبيه: النشر متوقف</b>\n\nصار ${fmtDur(since)} وما نُشر ولا تطبيق، والطابور فيه ${pending} منتظر.\n\nالأسباب المحتملة:\n• اشتراكك بموقع أحمد انتهى\n• مشكلة بجيت هَب أو تلقرام\n\nافتح «🧠 لوحتي» ← 📊 التقرير لتشوف آخر خطأ.`);
+  await notifyOwners(env, `🔴 <b>تنبيه: النشر متوقف</b>\n\nصار ${fmtDur(since)} وما نُشر ولا تطبيق، والطابور فيه ${pending} منتظر.\n\nالأسباب المحتملة:\n• قناة المصدر ما فيها جديد\n• مشكلة بجيت هَب أو تلقرام أو جيمناي\n\nافتح «🧠 لوحتي» ← 📊 التقرير لتشوف آخر خطأ.`);
 }
 
 // تقرير أسبوعي (كل جمعة بعد 9 مساءً السعودية، مرة واحدة)

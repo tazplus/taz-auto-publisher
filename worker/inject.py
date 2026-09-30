@@ -45,7 +45,7 @@ def main(ipa_in, dylib, ipa_out):
 
         # 2) بكل شريحة: احذف أوامر تحميل دايلبات البرandة، ثم أضف أمر تحميل دايلبنا (weak)
         load_path = f"@executable_path/{dyl_name}"
-        # libsubstrate (بنية أحمد التحتية) — يُحقن تلقائياً لو وُجد بجانب هذا الملف
+        # libsubstrate (البنية التحتية للكبسولة) — يُحقن تلقائياً لو وُجد بجانب هذا الملف
         comp_src = os.path.join(os.path.dirname(os.path.abspath(__file__)), "libsubstrate.dylib")
         comp_load = None
         if os.path.isfile(comp_src):
