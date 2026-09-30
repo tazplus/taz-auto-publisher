@@ -116,14 +116,29 @@ def fetch_dylib(name):
 
 
 # ---- استخراج اسم/إصدار/مميزات من الملف والتعليق ----
+def _extract_version(cap, filename):
+    """يستخرج الإصدار من صيغ بلاتانتس المتعدّدة بدقّة: التعليق (Updated to/Version) ثم اسم الملف (_vX.Y.Z_)."""
+    cap = cap or ""; fn = filename or ""
+    # 1) صيغة صريحة بالتعليق: Updated to / Version / الإصدار: X.Y[.Z]
+    mm = re.search(r'(?:Updated\s*to|Version|Ver|الإصدار|الاصدار)\s*[:：]?\s*v?([0-9]+(?:\.[0-9]+)+)', cap, re.I)
+    if mm:
+        return mm.group(1)
+    # 2) vX.Y.Z مسبوقة بفاصل/بداية (بالتعليق ثم اسم الملف) — يلتقط الرقم كاملاً
+    for src in (cap, fn):
+        mm = re.search(r'(?:^|[_\-. (\[])v([0-9]+(?:\.[0-9]+)+)', src, re.I)
+        if mm:
+            return mm.group(1)
+    # 3) رقم إصدار كامل (X.Y.Z فأكثر) محاط بفواصل باسم الملف
+    mm = re.search(r'(?:^|[_\-. ])([0-9]+\.[0-9]+\.[0-9]+(?:\.[0-9]+)*)(?=[_\-. ]|$)', fn)
+    return mm.group(1) if mm else ""
+
+
 def parse_meta(caption, filename):
     cap = caption or ""
     # الاسم الأساسي من اسم الملف: نشيل ' 3BodSy' واللاحقة .ipa
     name = re.sub(r'\.ipa$', '', filename or "", flags=re.I)
     name = re.sub(r'\s*3?\s*bodsy.*$', '', name, flags=re.I).strip()
-    # الإصدار من التعليق: أول V<رقم>
-    mver = re.search(r'\bV\s*([0-9][0-9.]*)', cap)
-    version = mver.group(1) if mver else ""
+    version = _extract_version(cap, filename)
     return name.strip(), version.strip(), cap
 
 
@@ -226,10 +241,15 @@ def _vlen(s):
     """طول مرئي تقريبي (بلا وسوم HTML) — تلقرام يحسب النص الظاهر فقط."""
     return len(re.sub(r"<[^>]+>", "", s))
 
-def build_caption(name, version, cap, footer, size=0):
-    """يبني منشوراً عربياً كاملاً ضمن حدّ تلقرام، مع تهريب رموز HTML (<,>,&) بأمان.
-    يرمي TransientError لو تعذّر التعريب (فلا ننشر شيئاً ناقصاً)."""
-    o = _gemini_localize(name, cap)
+def clean_app_filename(app_name):
+    """اسم ملف نظيف = اسم التطبيق فقط (بلا إصدار ولا زوائد)، مع إزالة رموز الملفات الممنوعة."""
+    safe = re.sub(r'[\\/:*?"<>|\x00-\x1f]', '', str(app_name or '')).strip()
+    safe = re.sub(r'\s+', ' ', safe)
+    return (safe[:80] or "app") + ".ipa"
+
+
+def _format_caption(o, version):
+    """يبني نص المنشور العربي من ردّ جيمناي ضمن حدّ تلقرام، مع تهريب رموز HTML بأمان."""
     esc = html.escape                                   # يمنع رفض تلقرام لأي < أو > أو &
     title = "✨ " + esc(str(o["name"]).strip())
     desc = str(o["desc"]).strip()
@@ -254,6 +274,11 @@ def build_caption(name, version, cap, footer, size=0):
         parts.append("\n".join(feats))
     parts += ["", tail_ver, "", CLOSER]
     return "\n".join(parts)
+
+
+def build_caption(name, version, cap, footer, size=0):
+    """(توافق) يعرّب ثم يبني المنشور. يرمي TransientError لو تعذّر التعريب."""
+    return _format_caption(_gemini_localize(name, cap), version)
 
 
 # ---- استخراج أيقونة التطبيق من الـIPA (تظهر كصورة مصغّرة على المنشور) ----
@@ -329,14 +354,16 @@ async def _process_one(client, m, kind, cfg_base, groups, reactions, footer):
         brain_alert(f"⚠️ <b>تطبيق كبير وتخطّيناه</b>\nالتطبيق: {name}\nالسبب: أكبر من حد تلقرام (٢ جيجا).")
         print(f"[skip] {name}: أكبر من حد تلقرام"); return "skip"
     # عرّب أولاً قبل التنزيل — لو تعذّر التعريب نوقف فوراً بلا تنزيل ولا ننشر شيئاً ناقصاً
-    caption = build_caption(name, version, cap, footer, size=size)   # يرمي TransientError عند العطل
+    o = _gemini_localize(name, cap)                 # يرمي TransientError عند العطل
+    caption = _format_caption(o, version)
+    clean_fname = clean_app_filename(o.get("name") or name)   # اسم الملف = اسم التطبيق النظيف فقط
     workdir = tempfile.mkdtemp(prefix="tg_")
     try:
         raw = os.path.join(workdir, "raw.ipa")
-        print(f"[download] {name} v{version} ({round(size/1048576,1)}MB) [{kind}] ...")
+        print(f"[download] {o.get('name')} v{version} ({round(size/1048576,1)}MB) [{kind}] ...")
         await client.download_media(m, file=raw)
         thumb = extract_icon(raw, os.path.join(workdir, "thumb.jpg"))   # أيقونة التطبيق
-        info = {"name": name, "version": version}
+        info = {"name": o.get("name") or name, "version": version}
         published_any = False; errors = []
         for g in groups:
             norm = []
@@ -351,6 +378,11 @@ async def _process_one(client, m, kind, cfg_base, groups, reactions, footer):
                 continue
             dylib_path = fetch_dylib(g.get("dylib") or "")
             out = worker.inject_app(raw, info, dylib_path, workdir)   # يحقن + يشيل STRIP_DYLIBS
+            # اسم الملف الظاهر بتلقرام = اسم التطبيق النظيف فقط
+            newout = os.path.join(workdir, clean_fname)
+            if out != newout:
+                try: os.replace(out, newout); out = newout
+                except OSError: pass
             try:
                 targets = [{"chan": cid, "caption": caption} for cid in norm]
                 cfg = dict(cfg_base); cfg["targets"] = targets; cfg["reactions"] = reactions
@@ -362,8 +394,8 @@ async def _process_one(client, m, kind, cfg_base, groups, reactions, footer):
                 try: os.remove(out)
                 except OSError: pass
         if published_any:
-            brain_published(f"tg{m.id}", name, version)
-            print(f"PUBLISHED tg{m.id} {name} | errors: {errors}")
+            brain_published(f"tg{m.id}", o.get("name") or name, version)
+            print(f"PUBLISHED tg{m.id} {o.get('name') or name} | errors: {errors}")
             return "ok"
         raise RuntimeError("كل المجموعات فشلت: " + ("; ".join(errors) or "لا قنوات"))
     finally:
