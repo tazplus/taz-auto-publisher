@@ -35,10 +35,10 @@ def main(ipa_in, dylib, ipa_out):
 
         # دايلبات البرandة (المصدر) اللي نشيلها قبل حقن دايلبنا — يبقى الهاك والفريمويركات
         strip = set(x.strip() for x in os.environ.get(
-            "STRIP_DYLIBS", "Check0verPlus.dylib").split(",") if x.strip())
+            "STRIP_DYLIBS", "blatantsPatch.dylib,AutoRcSideload.dylib").split(",") if x.strip())
 
         # 1) copy our dylib to .app root, named after its install-id basename
-        dyl_name = "ThamerScreen.dylib"
+        dyl_name = "TAZPlus.dylib"
         dst = os.path.join(app, dyl_name)
         shutil.copy(dylib, dst)
         os.chmod(dst, 0o644)
