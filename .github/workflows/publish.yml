@@ -17,8 +17,14 @@ jobs:
       - uses: actions/setup-python@v5
         with: { python-version: '3.11' }
       - run: pip install -r worker/requirements.txt
-      - name: write dylib from secret (gzip+base64)
-        run: printf '%s' "${{ secrets.DYLIB_GZ_B64 }}" | base64 -d | gunzip > worker/fixipa.dylib
+      - name: write dylib from secret (gzip+base64) — optional
+        run: |
+          if [ -n "${{ secrets.DYLIB_GZ_B64 }}" ]; then
+            printf '%s' "${{ secrets.DYLIB_GZ_B64 }}" | base64 -d | gunzip > worker/fixipa.dylib
+            echo "wrote fallback dylib from secret"
+          else
+            echo "no DYLIB_GZ_B64 secret — worker will fetch active dylib from brain"
+          fi
       - name: process & publish
         working-directory: worker
         env:

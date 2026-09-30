@@ -5,12 +5,12 @@ compatibility_date = "2024-11-01"
 [[d1_databases]]
 binding = "DB"
 database_name = "taz_publisher"
-database_id = "PUT_TAZ_D1_ID_HERE"   # يُملأ بعد: wrangler d1 create taz_publisher
+database_id = "c8a0639f-2440-41cf-8496-3e1e8f142624"
 
 # مخزن ملفات الدايلب (يُرسلها المالك من البوت ويختار الفعّال)
 [[kv_namespaces]]
 binding = "DYLIBS"
-id = "PUT_TAZ_KV_ID_HERE"   # يُملأ بعد: wrangler kv namespace create DYLIBS
+id = "0187ee76e5084122b50805236224bd92"
 
 [triggers]
 crons = ["*/3 * * * *"]   # كل 3 دقائق: يفحص الطابور؛ الحد الفعلي per_hour (افتراضي 10)
