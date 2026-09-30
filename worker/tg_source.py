@@ -215,16 +215,37 @@ def _gemini_localize(name, cap):
     raise TransientError("تعذّر التعريب عبر كل موديلات جيمناي — آخر سبب: " + last)
 
 
+CAPTION_LIMIT = 1000   # حدّ تلقرام للتعليق 1024 حرف مرئي — نبقى دونه بأمان
+
+def _vlen(s):
+    """طول مرئي تقريبي (بلا وسوم HTML) — تلقرام يحسب النص الظاهر فقط."""
+    return len(re.sub(r"<[^>]+>", "", s))
+
 def build_caption(name, version, cap, footer, size=0):
-    """يبني منشوراً عربياً كاملاً. يرمي TransientError لو تعذّر التعريب (فلا ننشر شيئاً ناقصاً)."""
+    """يبني منشوراً عربياً كاملاً ضمن حدّ تلقرام. يرمي TransientError لو تعذّر التعريب."""
     o = _gemini_localize(name, cap)
-    lines = ["✨ " + str(o["name"]).strip(), "", str(o["desc"]).strip(), "", "🔹 المميزات:"]
+    title = "✨ " + str(o["name"]).strip()
+    desc = str(o["desc"]).strip()
+    if _vlen(desc) > 400:                      # وصف طويل جداً → قصّه بأمان
+        desc = desc[:400].rstrip() + "…"
+    tail_ver = "📱 الإصدار: " + (version or "—")
+    # الأجزاء الثابتة (عنوان + وصف + عنوان المميزات + الإصدار + الخاتمة) لها الأولوية
+    fixed = "\n".join([title, "", desc, "", "🔹 المميزات:", "", tail_ver, "", CLOSER])
+    budget = CAPTION_LIMIT - _vlen(fixed)
+    feats = []
     for f in (o.get("features") or [])[:6]:
         f = str(f).strip().lstrip("•-*·").strip()
-        if f:
-            lines.append("• " + f)
-    lines += ["", "📱 الإصدار: " + (version or "—"), "", CLOSER]
-    return "\n".join(lines)
+        if not f:
+            continue
+        line = "• " + f
+        if _vlen("\n".join(feats + [line])) > budget:   # لا تتجاوز المتبقّي
+            break
+        feats.append(line)
+    parts = [title, "", desc, "", "🔹 المميزات:"]
+    if feats:
+        parts.append("\n".join(feats))
+    parts += ["", tail_ver, "", CLOSER]
+    return "\n".join(parts)
 
 
 # ---- استخراج أيقونة التطبيق من الـIPA (تظهر كصورة مصغّرة على المنشور) ----
