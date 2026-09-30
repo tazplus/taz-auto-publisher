@@ -12,7 +12,8 @@ Env:
   DYLIB_PATH                                           # دايلب احتياطي
   STRIP_DYLIBS = 3BodSyPatch.dylib                     # بصمة المصدر (تُشال)
 """
-import os, re, sys, html, json, random, tempfile, shutil, traceback, struct, zlib, zipfile, glob, asyncio, requests
+import os, re, sys, html, json, random, time, tempfile, shutil, traceback, struct, zlib, zipfile, glob, asyncio, requests
+from datetime import datetime, timezone, timedelta
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 from telethon.tl.types import MessageMediaDocument, DocumentAttributeFilename
@@ -53,6 +54,44 @@ def brain_alert(msg):
         requests.post(BRAIN + "/alert", headers=HDR, json={"msg": msg}, timeout=30)
     except Exception as e:
         print("[alert] failed:", e)
+
+def brain_stats(payload):
+    """يرفع تحليلات القناة اليومية للمخ (مشاهدات/تفاعلات/منشورات)."""
+    try:
+        requests.post(BRAIN + "/stats", headers=HDR, json=payload, timeout=30)
+    except Exception as e:
+        print("[stats] post failed:", e)
+
+def brain_backfill_done():
+    """يبلّغ المخ بانتهاء السحب التدريجي (يوقفه ويرسل تنبيهاً مرة واحدة)."""
+    try:
+        requests.post(BRAIN + "/tgsource", headers=HDR, json={"backfill_done": 1}, timeout=30)
+    except Exception as e:
+        print("[backfill] done post failed:", e)
+
+
+async def collect_stats(client, ident):
+    """يمسح منشورات اليوم بالقناة (بتوقيت السعودية) ويجمع المشاهدات والتفاعلات ويرفعها للمخ."""
+    ksa = timezone(timedelta(hours=3))
+    day_start = datetime.now(ksa).replace(hour=0, minute=0, second=0, microsecond=0)
+    day_str = day_start.strftime("%Y-%m-%d")
+    start_ts = day_start.timestamp()
+    ent = await client.get_entity(ident)
+    views = reactions = posts = 0
+    async for m in client.iter_messages(ent, limit=400):
+        if not m.date:
+            continue
+        if m.date.timestamp() < start_ts:      # أقدم من بداية اليوم → وقف
+            break
+        posts += 1
+        views += (m.views or 0)
+        try:
+            if m.reactions and m.reactions.results:
+                reactions += sum((r.count or 0) for r in m.reactions.results)
+        except Exception:
+            pass
+    brain_stats({"day": day_str, "views": views, "reactions": reactions, "posts": posts})
+    print(f"[stats] {day_str} مشاهدات={views} تفاعلات={reactions} منشورات={posts}")
 
 PER_APP_TIMEOUT = 480   # مهلة كل تطبيق (ث): بعدها نتخطّاه فوراً بلا تعليق
 
@@ -308,37 +347,74 @@ async def _run():
     gk = (st.get("gemini_key") or "").strip()
     if gk and not os.environ.get("GEMINI_API_KEY"):
         os.environ["GEMINI_API_KEY"] = gk
-    if not st.get("enabled", True):
-        print("مصدر تلقرام موقوف"); return
+    enabled = bool(st.get("enabled", True))
     limit = int(st.get("limit", 4) or 4)
     groups = st.get("groups", [])
     reactions = [e.strip() for e in (st.get("reactions") or "").split(",") if e.strip()]
     footer = st.get("footer", "")
-    last_id = int(st.get("last_id", 0) or 0)   # مؤشّر الجديد (id > last_id)
-    back_id = int(st.get("back_id", 0) or 0)   # مؤشّر الباكفل (id < back_id)؛ 0 = لا باكفل
-    min_id = int(st.get("min_id", 0) or 0)     # حد الباكفل (تاريخ 2–3 أشهر)
-    if not groups:
-        print("لا قنوات مفعّلة — تخطٍّ"); return
+    last_id = int(st.get("last_id", 0) or 0)     # مؤشّر الجديد (id > last_id)
+    back_id = int(st.get("back_id", 0) or 0)     # مؤشّر الباكفل (يمشي للأسفل)
+    backfill_on = bool(st.get("backfill"))       # السحب التدريجي مفعّل؟
+    back_days = int(st.get("back_days", 90) or 90)  # نافذة السحب (أيام) — افتراضي 3 شهور
+
+    # قناة الوجهة لجمع التحليلات (أول قناة بالمجموعات أو المتغيّر)
+    stats_ident = None
+    for g in groups:
+        for c in (g.get("channels") or []):
+            stats_ident = (c.get("id") if isinstance(c, dict) else c)
+            if stats_ident:
+                break
+        if stats_ident:
+            break
+    stats_ident = stats_ident or os.environ.get("TG_CHANNEL") or None
 
     api_id = int(os.environ["TG_USER_API_ID"]); api_hash = os.environ["TG_USER_API_HASH"]
     sess = os.environ["TG_USER_SESSION"]
     cfg_base = telegram.cfg_from_env()
 
     async with TelegramClient(StringSession(sess), api_id, api_hash) as client:
-        # اجمع الجديد (id>last_id) + الباكفل (id<back_id حتى min_id)
+        # 📊 تحليلات القناة (مشاهدات/تفاعلات/منشورات اليوم) — تعمل حتى لو النشر موقوف
+        if stats_ident:
+            try:
+                await collect_stats(client, stats_ident)
+            except Exception as e:
+                print("[stats] fail:", str(e)[:120])
+                brain_alert("⚠️ <b>تعذّر جمع تحليلات اليوم</b>\nالسبب: " + str(e)[:140])
+
+        if not enabled:
+            print("مصدر تلقرام موقوف (جُمعت التحليلات فقط)"); return
+        if not groups:
+            print("لا قنوات مفعّلة — تخطٍّ"); return
+
+        # بدء السحب التدريجي: نقطة الانطلاق = آخر ما عالجناه (نمشي منها للأسفل)
+        if backfill_on and not back_id:
+            back_id = last_id
+            brain_set_state(back_id=back_id)
+        cutoff = int(time.time()) - back_days * 86400   # حدّ آخر back_days يوم
+
+        # اجمع الجديد (id>last_id)
         new = []
         async for m in client.iter_messages(CH, min_id=last_id, reverse=True, limit=limit * 4):
             if _is_ipa(m):
                 new.append(m)
         new = new[:limit]
-        back = []
+
+        # الباكفل بالتاريخ: انزل من back_id، خذ اللي داخل النافذة، ووقف عند أقدم منها
+        back = []; reached_end = False; more_in_window = False
         room = limit - len(new)
-        if room > 0 and back_id and back_id > min_id:
-            async for m in client.iter_messages(CH, offset_id=back_id, limit=room * 4):
-                if _is_ipa(m) and m.id > min_id:
-                    back.append(m)
-            back = back[:room]
+        if backfill_on and room > 0 and back_id:
+            collected = []
+            async for m in client.iter_messages(CH, offset_id=back_id, limit=room * 8):
+                if m.date and m.date.timestamp() < cutoff:
+                    reached_end = True; break          # وصلنا حدّ الـback_days → خلصنا
+                if _is_ipa(m):
+                    collected.append(m)
+            more_in_window = len(collected) > room
+            back = collected[:room]
+
         if not new and not back:
+            if backfill_on and reached_end and not more_in_window:
+                brain_backfill_done()
             print("لا جديد ولا باكفل"); return
         print(f"جديد: {len(new)} | باكفل: {len(back)}")
 
@@ -383,6 +459,9 @@ async def _run():
                 brain_set_state(back_id=m.id)
                 brain_alert(f"⚠️ <b>تطبيق قديم فشل وتخطّيناه</b>\nالسبب: {str(e)[:150]}\n(المصدر: رسالة {m.id})")
                 traceback.print_exc(); print(f"[fail back] tg{m.id} skipped: {str(e)[:200]}")
+        # وصلنا حدّ آخر back_days يوم بلا متبقٍّ داخل النافذة → السحب التدريجي خلص
+        if backfill_on and reached_end and not more_in_window:
+            brain_backfill_done()
         print(f"تمّت معالجة {done} تطبيق")
 
 
