@@ -1,0 +1,16 @@
+name = "taz-auto-publisher"
+main = "src/index.js"
+compatibility_date = "2024-11-01"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "taz_publisher"
+database_id = "PUT_TAZ_D1_ID_HERE"   # يُملأ بعد: wrangler d1 create taz_publisher
+
+# مخزن ملفات الدايلب (يُرسلها المالك من البوت ويختار الفعّال)
+[[kv_namespaces]]
+binding = "DYLIBS"
+id = "PUT_TAZ_KV_ID_HERE"   # يُملأ بعد: wrangler kv namespace create DYLIBS
+
+[triggers]
+crons = ["*/3 * * * *"]   # كل 3 دقائق: يفحص الطابور؛ الحد الفعلي per_hour (افتراضي 10)

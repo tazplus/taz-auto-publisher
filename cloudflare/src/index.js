@@ -1,0 +1,1304 @@
+/**
+ * عقل النشر الآلي — Cloudflare Worker
+ * - يستقبل قائمة التطبيقات المحدّثة من الماسح (GitHub) ويعبّي الطابور
+ * - كل بضع دقائق يطلق تطبيقاً واحداً (بحد 10/ساعة) لعامل GitHub لتحميله وحقنه ونشره
+ * - لوحة تحكم كاملة عبر أزرار بوت تلقرام (على خاص المالك)
+ * - يمنع تكرار نفس التطبيق أكثر من مرة باليوم
+ *
+ * أسرار (wrangler secret): TG_BOT_TOKEN, OWNER_ID, GH_TOKEN, GH_REPO (owner/name),
+ *   ENQUEUE_SECRET, AHMAD_WEBHOOK_SECRET
+ */
+
+const KSA_OFFSET = 3 * 3600; // توقيت السعودية UTC+3
+
+// ---------- أدوات ----------
+const nowSec = () => Math.floor(Date.now() / 1000);
+const ksaDay = (t = nowSec()) => new Date((t + KSA_OFFSET) * 1000).toISOString().slice(0, 10);
+async function getSetting(env, k, d = null) {
+  const r = await env.DB.prepare('SELECT value FROM settings WHERE key=?').bind(k).first();
+  return r ? r.value : d;
+}
+async function setSetting(env, k, v) {
+  await env.DB.prepare('INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=?')
+    .bind(k, String(v), String(v)).run();
+}
+async function logEvent(env, kind, msg) {
+  await env.DB.prepare('INSERT INTO log(ts,kind,msg) VALUES(?,?,?)').bind(nowSec(), kind, msg).run();
+}
+
+// ترجمة أي خطأ تقني لسبب عربي واضح (يُستخدم بالتنبيه والسجل معاً — لا إنقلش للمالك أبداً)
+function arErr(msg) {
+  const m = String(msg || '');
+  if (/OVERSIZE|file parts is invalid|entity too large|too big/i.test(m)) return 'التطبيق أكبر من حد تلقرام (٢ جيجا) — لا يمكن رفعه';
+  if (/DEAD_APP|0-byte/i.test(m)) return 'ملف تالف على الخادم (فارغ)';
+  if (/wait of \d+ seconds/i.test(m)) return 'تلقرام حدّ الرفع مؤقتاً (سيُعاد لاحقاً)';
+  if (/two different IP|authorization key/i.test(m)) return 'الجلسة استُخدمت من مكانين معاً (سيُعاد لاحقاً)';
+  if (/not an IPA/i.test(m)) return 'الملف المحمّل ليس تطبيقاً سليماً';
+  if (/truncated/i.test(m)) return 'التحميل انقطع قبل اكتماله';
+  if (/login failed/i.test(m)) return 'تعذّر تسجيل الدخول لموقع أحمد';
+  if (/not found in recent/i.test(m)) return 'التطبيق ما عاد موجوداً بقائمة أحمد';
+  if (/inject|lief|dylib/i.test(m)) return 'تعذّر حقن الإضافة بالتطبيق';
+  if (/timed? ?out|timeout/i.test(m)) return 'انتهت المهلة (الملف كبير أو الشبكة بطيئة)';
+  if (/connection|network|resolve|ECONN|SSL|certificate/i.test(m)) return 'انقطاع بالاتصال أثناء التحميل';
+  if (/403|forbidden|401|unauthorized/i.test(m)) return 'رُفض الوصول (صلاحية أو جلسة منتهية)';
+  if (/space|disk|memory/i.test(m)) return 'نفدت المساحة أثناء المعالجة';
+  if (/chat not found|bot was blocked|CHANNEL_INVALID/i.test(m)) return 'مشكلة بالوصول للقناة (تحقق من صلاحية البوت)';
+  return 'خطأ غير متوقع أثناء المعالجة';
+}
+
+// ---------- تلقرام ----------
+async function tg(env, method, payload) {
+  const r = await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/${method}`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload),
+  });
+  return r.json();
+}
+const H = (s) => String(s ?? '').replace(/[<&>]/g, (c) => ({ '<': '&lt;', '&': '&amp;', '>': '&gt;' }[c]));
+
+// الملّاك مخزّنون بجدول settings (تُعدَّل من البوت نفسه)؛ عند الفراغ نبدأ من سر OWNER_ID
+async function getOwners(env) {
+  const stored = await getSetting(env, 'owners', '');
+  const ids = (stored || String(env.OWNER_ID || '')).split(',').map(s => s.trim()).filter(Boolean);
+  return [...new Set(ids)];
+}
+async function setOwners(env, ids) {
+  await setSetting(env, 'owners', [...new Set(ids.map(String))].filter(Boolean).join(','));
+}
+async function notifyOwners(env, text, extra = {}) {
+  for (const id of await getOwners(env)) {
+    await tg(env, 'sendMessage', { chat_id: id, parse_mode: 'HTML', text, ...extra });
+  }
+}
+
+// ---------- تشغيل عامل GitHub ----------
+async function dispatchWorker(env, app, footer, groups) {
+  const reactions = await getSetting(env, 'reactions', '🔥,❤️');   // تفاعلات البوت التلقائية (فارغ = إيقاف)
+  const res = await fetch(`https://api.github.com/repos/${env.GH_REPO}/dispatches`, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${env.GH_TOKEN}`,
+      'Accept': 'application/vnd.github+json',
+      'User-Agent': 'ahmad-auto-publisher',
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify({ event_type: 'publish_app', client_payload: {
+      app_id: app.app_id, download_url: app.download_url, footer: footer || '',
+      groups: groups || [],   // [{dylib, channels}] — العامل يحقن لكل مجموعة (toJSON بالورك فلو)
+      name: app.name || '', version: app.version || '',
+      meta: (() => { try { return JSON.parse(app.meta || '{}'); } catch { return {}; } })(),  // وصف/أيقونة/حجم للمنشور
+      reactions,   // تفاعلات تلقائية على المنشور
+    } }),
+  });
+  return res.ok;
+}
+
+// مجموعات النشر لقسم: [{dylib, channels:[ident,...]}] — القنوات مجمّعة حسب دايلبها
+// (قنوات نفس الدايلب = مجموعة واحدة تُحقن مرة؛ إن لم تُضبط قنوات → الرئيسية بالدايلب الفعّال)
+async function targetGroups(env, sectionKey) {
+  const active = await getSetting(env, 'dylib_active', '');
+  const any = await env.DB.prepare('SELECT COUNT(*) c FROM channels WHERE enabled=1').first();
+  if (!any || !any.c) {
+    const main = env.TG_CHANNEL || await getSetting(env, 'channel', '');
+    return main ? [{ dylib: active, channels: [main] }] : [];
+  }
+  const rows = (await env.DB.prepare(
+    `SELECT c.chat_id, c.username, c.dylib FROM channels c JOIN channel_sections cs ON c.chat_id = cs.chat_id
+     WHERE c.enabled = 1 AND cs.section_key = ?`).bind(sectionKey).all()).results || [];
+  const byDylib = {};
+  for (const r of rows) {
+    const dyl = r.dylib || active || '';             // قناة بلا دايلب خاص → الافتراضي العام
+    const ident = r.username || r.chat_id;            // @username أضمن للتحليل من الرقم الخام
+    (byDylib[dyl] = byDylib[dyl] || []).push(ident);
+  }
+  return Object.entries(byDylib).map(([dylib, channels]) => ({ dylib, channels }));
+}
+
+// جلب بيانات قناة (للتحقق/التسمية)
+async function getChat(env, chatId) {
+  const r = await tg(env, 'getChat', { chat_id: chatId });
+  return (r && r.ok) ? r.result : null;
+}
+
+// شاشة إدارة قناة: تفعيل + اختيار الأقسام (✅) + حذف
+async function channelView(env, cid) {
+  const c = await env.DB.prepare('SELECT * FROM channels WHERE chat_id=?').bind(cid).first();
+  if (!c) return null;
+  const secs = await loadSections(env, false);
+  const subs = new Set(((await env.DB.prepare('SELECT section_key FROM channel_sections WHERE chat_id=?').bind(cid).all()).results || []).map(r => r.section_key));
+  const kb = secs.map(s => [{ text: `${subs.has(s.key) ? '✅' : '⬜️'} ${s.name}`, callback_data: `chsec_${cid}_${s.key}` }]);
+  kb.push([{ text: `📎 دايلب القناة: ${c.dylib || 'الافتراضي العام'}`, callback_data: `chdyl_${cid}` }]);
+  kb.push([{ text: `✏️ نص القناة: ${c.footer ? (c.footer.length > 18 ? c.footer.slice(0, 18) + '…' : c.footer) : 'النص العام'}`, callback_data: `chfoot_${cid}` }]);
+  kb.push([{ text: `🔔 تنبيهات القناة لـ: ${c.owner || 'الكل'}`, callback_data: `chown_${cid}` }]);
+  kb.push([{ text: c.enabled ? '🔴 إيقاف القناة' : '🟢 تفعيل القناة', callback_data: `chtog_${cid}` }]);
+  kb.push([{ text: '🗑️ حذف القناة', callback_data: `chdel_${cid}` }]);
+  kb.push([{ text: '⬅️ القنوات', callback_data: 'channels' }]);
+  const text = `<b>${H(c.name || cid)}</b>\nالحالة: ${c.enabled ? '🟢 مفعّلة' : '⚪️ موقوفة'}\nالدايلب: ${H(c.dylib || 'الافتراضي العام')}\nنص القناة: ${H(c.footer || 'النص العام')}\nتنبيهاتها لـ: ${H(c.owner || 'الكل')}\n\nاختر الأقسام اللي تنشر بهالقناة (✅ = تنشر فيها):`;
+  return { text, kb };
+}
+
+// شاشة مصدر التطبيقات (تلقرام 3BodSy): تشغيل/إيقاف + الحد لكل تشغيل + حالة الباكفل
+async function sourceView(env) {
+  const on = (await getSetting(env, 'tg_source_enabled', '0')) === '1';
+  const limit = parseInt(await getSetting(env, 'tg_source_limit', '4'), 10) || 4;
+  const backId = parseInt(await getSetting(env, 'tg_back_id', '0'), 10) || 0;
+  const minId = parseInt(await getSetting(env, 'tg_min_id', '0'), 10) || 0;
+  const backfilling = backId && backId > minId;
+  const text = `<b>📥 مصدر التطبيقات</b>\n\n` +
+    `الحالة: ${on ? '🟢 يعمل' : '⚪️ موقوف'}\n` +
+    `كل تشغيل: ${limit} تطبيق (كل 10 دقائق)\n` +
+    `السحب التدريجي: ${backfilling ? '🟡 شغّال (يسحب القديم بالتدريج)' : '✅ منتهٍ — الجديد فقط'}\n\n` +
+    `<i>يقرأ القناة تلقائياً، يشيل بصمتهم، يحقن بصمتك، وينشر بقنواتك.</i>`;
+  const kb = [
+    [{ text: on ? '⏸️ إيقاف المصدر' : '▶️ تشغيل المصدر', callback_data: 'srctog' }],
+    [{ text: `🔢 كل تشغيل: ${limit}`, callback_data: 'srclim' }],
+    [{ text: '⬅️ رجوع', callback_data: 'global' }],
+  ];
+  return { text, kb };
+}
+
+// شاشة الدايلبات: قائمة + المؤشّر ✅ للفعّال + زر حذف (نستخدم rowid بالأزرار لأمان الأسماء)
+async function dylibsView(env) {
+  const rows = (await env.DB.prepare('SELECT rowid AS id,name,size FROM dylibs ORDER BY added_at DESC').all()).results || [];
+  const active = await getSetting(env, 'dylib_active', '');
+  const kb = rows.map(r => [
+    { text: `${r.name === active ? '✅' : '⬜️'} ${r.name}`, callback_data: `dyl_${r.id}` },
+    { text: '✏️', callback_data: `dylren_${r.id}` },
+    { text: '🗑️', callback_data: `dyldel_${r.id}` },
+  ]);
+  const text = rows.length
+    ? '<b>📎 الدايلب</b>\nالفعّال ✅ يُحقن بكل التطبيقات.\n• اضغط الاسم ← يصير الفعّال\n• ✏️ ← إعادة تسمية\n• 🗑️ ← حذف\n\n<i>لإضافة: أرسل ملف .dylib هنا.</i>'
+    : '<b>📎 الدايلب</b>\n\nما فيه دايلبات بعد.\n\n<i>أرسل ملف .dylib للبوت هنا وبيتخزّن باسمه ويصير الفعّال.</i>';
+  return { text, kb };
+}
+
+// اكتشاف تلقائي: عند جعل البوت مشرفاً بقناة → تُسجّل (موقوفة) ويُنبَّه المالك؛ وعند إزالته → تُوقَف
+async function handleMyChatMember(env, upd) {
+  const chat = upd.chat;
+  if (!chat || chat.type !== 'channel') return;
+  const chatId = String(chat.id);
+  const status = upd.new_chat_member ? upd.new_chat_member.status : '';
+  if (status === 'administrator') {
+    const ex = await env.DB.prepare('SELECT 1 FROM channels WHERE chat_id=?').bind(chatId).first();
+    if (!ex) {
+      await env.DB.prepare('INSERT INTO channels(chat_id,name,username,enabled,added_at) VALUES(?,?,?,0,?)')
+        .bind(chatId, chat.title || '', chat.username ? '@' + chat.username : '', nowSec()).run();
+      await notifyOwners(env, `📢 <b>قناة جديدة اكتُشفت</b>\n\n${H(chat.title || chatId)}\n\nافتح «📢 القنوات» لتفعيلها واختيار أقسامها.`);
+    }
+  } else if (status === 'left' || status === 'kicked') {
+    await env.DB.prepare("UPDATE channels SET enabled=0 WHERE chat_id=?").bind(chatId).run();
+  }
+}
+
+// ---------- المنطق الأساسي: الطابور ----------
+const isValidDL = (u) => typeof u === 'string' && u.startsWith('https://check0ver.net/');
+const isValidId = (v) => /^[A-Za-z0-9-]{6,64}$/.test(String(v));   // uuid تطبيق CheckOver
+
+// فهرس تصنيفات CheckOver المتاحة للإضافة (key = مفتاح القسم، id = uuid التصنيف)
+const CATALOG = [
+  { key: 'games',  id: '9c60f563-1983-42f0-8882-a26207bd4aaf', name: '🎮 الألعاب' },
+  { key: 'apps',   id: '9c60f57f-b2be-49b8-be17-aa0231a3ec50', name: '📱 التطبيقات' },
+  { key: 'paid',   id: '9c65bb1e-afb0-427b-8811-547ae30dd6a7', name: '💰 المدفوعة' },
+  { key: 'design', id: '9c65babe-44ec-41f4-b452-98e8f4649479', name: '🎨 التصاميم' },
+  { key: 'ai',     id: '9d0e57a6-7eee-4020-a849-fa501b874c81', name: '🤖 الذكاء الاصطناعي' },
+  { key: 'movies', id: '9c65baf5-009e-40a0-837c-355a4d5822f1', name: '🎬 أفلام ومسلسلات' },
+  { key: 'social', id: '9c65ba8d-2d83-48aa-91e5-459dd84b2651', name: '💬 تواصل اجتماعي' },
+];
+
+// الأقسام أصبحت ديناميكية (جدول sections) — تُدار بالكامل من البوت
+async function loadSections(env, onlyEnabled = true) {
+  const rows = (await env.DB.prepare('SELECT key,name,path,quota,enabled,ord FROM sections ORDER BY ord ASC, rowid ASC').all()).results || [];
+  return onlyEnabled ? rows.filter(r => r.enabled) : rows;
+}
+async function sectionName(env, key) {
+  const r = await env.DB.prepare('SELECT name FROM sections WHERE key=?').bind(key).first();
+  return r ? r.name : key;
+}
+async function sectionExists(env, key) {
+  return !!(await env.DB.prepare('SELECT 1 FROM sections WHERE key=?').bind(key).first());
+}
+
+async function enqueueApps(env, section, apps) {
+  // apps: [{id, name, version, download_url, rank, meta}] بترتيب صفحة القسم (rank=0 أعلى)
+  if (!(await sectionExists(env, section))) section = 'games';
+  if (!Array.isArray(apps)) return 0;
+  let added = 0;
+  for (const a of apps) {
+    if (!a || !isValidId(a.id) || !isValidDL(a.download_url)) continue;
+    const ver = a.version || '';
+    const bl = await env.DB.prepare('SELECT 1 FROM blacklist WHERE app_id=?').bind(a.id).first();
+    if (bl) continue;
+    // نُشر هذا الإصدار من قبل؟ تجاهل (منع تكرار بالإصدار — القسم يمشي للتالي)
+    const pub = await env.DB.prepare('SELECT 1 FROM published WHERE app_id=? AND version=?')
+      .bind(a.id, ver).first();
+    if (pub) continue;
+    // موجود بالطابور؟
+    const ex = await env.DB.prepare('SELECT status, version FROM queue WHERE app_id=?').bind(a.id).first();
+    if (ex) {
+      if (ex.status === 'pending') {
+        // حدّث بيانات pending فقط دون تغيير ترتيبه أو قسمه (رابط التحميل الطازج + البيانات)
+        await env.DB.prepare('UPDATE queue SET version=?, download_url=?, name=?, meta=? WHERE app_id=? AND status=?')
+          .bind(ver, a.download_url, a.name || '', JSON.stringify(a.meta || {}), a.id, 'pending').run();
+        continue;
+      }
+      // فشل سابقاً لكن نزل إصدار جديد → امنحه فرصة جديدة (احذف صف الفشل واتركه يُدرج من جديد)
+      if (ex.status === 'failed' && ex.version !== ver) {
+        await env.DB.prepare('DELETE FROM queue WHERE app_id=?').bind(a.id).run();
+      } else {
+        continue;  // قيد المعالجة، أو نفس النسخة الفاشلة → تجاهل
+      }
+    }
+    await env.DB.prepare('INSERT INTO queue(app_id,name,version,download_url,rank,added_at,status,section,meta) VALUES(?,?,?,?,?,?,?,?,?)')
+      .bind(a.id, a.name || '', ver, a.download_url, a.rank ?? 9999, nowSec(), 'pending', section, JSON.stringify(a.meta || {})).run();
+    added++;
+  }
+  if (added) await logEvent(env, 'info', `${await sectionName(env, section)}: أُضيف ${added}`);
+  return added;
+}
+
+const PROCESSING_TIMEOUT = 20 * 60; // ثانية: بعدها نعتبر العامل مات ونعيد التطبيق للطابور
+
+function safeCount(v, def) {
+  const n = parseInt(v, 10);
+  return (Number.isFinite(n) && n >= 0 && n <= 60) ? n : def; // fallback آمن، لا NaN أبداً
+}
+
+// كم نُشر/قيد المعالجة لقسم معيّن خلال آخر ساعة (كلاهما ضمن حدّ القسم)
+async function sectionInFlight(env, section) {
+  const p = await env.DB.prepare('SELECT COUNT(*) c FROM published WHERE section=? AND published_at >= ?')
+    .bind(section, nowSec() - 3600).first();
+  const q = await env.DB.prepare("SELECT COUNT(*) c FROM queue WHERE section=? AND status='processing'")
+    .bind(section).first();
+  return (p ? p.c : 0) + (q ? q.c : 0);
+}
+
+// أعِد أي تطبيق عالق في processing أقدم من المهلة إلى pending
+async function reclaimStuck(env) {
+  await env.DB.prepare("UPDATE queue SET status='pending' WHERE status='processing' AND processing_at < ?")
+    .bind(nowSec() - PROCESSING_TIMEOUT).run();
+  // نظّف صفوف الفشل القديمة (أسبوع+): تمنع تراكمها وتمنح التطبيق فرصة دورية لو رجع سليماً
+  await env.DB.prepare("DELETE FROM queue WHERE status='failed' AND processing_at < ?")
+    .bind(nowSec() - 7 * 86400).run();
+}
+
+// يُنادى من الكرون: أطلق تطبيقاً واحداً من قسم لم يبلغ حدّه بعد
+async function tick(env) {
+  if (await getSetting(env, 'enabled', '1') !== '1') return 'disabled';
+  const pausedUntil = parseInt(await getSetting(env, 'paused_until', '0'), 10) || 0;
+  if (pausedUntil && nowSec() < pausedUntil) return 'paused';
+
+  await reclaimStuck(env);
+
+  // النشر تسلسلي (مجموعة publish-serial بقِثهب: تشغيل واحد فقط في كل وقت).
+  // لا تُطلق تطبيقاً جديداً وآخرُ لم يزل قيد التنفيذ — وإلا تتزاحم التشغيلات ويُلغي قِثهب المتأخّر،
+  // فيتوقف النشر عن أغلب القنوات (خاصةً آخر قناة بالترتيب). ننتظر حتى يفرغ ثم نطلق التالي.
+  const inflight = await env.DB.prepare("SELECT COUNT(*) c FROM queue WHERE status='processing'").first();
+  if (inflight && inflight.c > 0) return 'busy';
+
+  const footer = await getSetting(env, 'footer', '');
+  const mix = (await getSetting(env, 'mix_mode', '0')) === '1';
+
+  // رتّب الأقسام المؤهّلة (لها حصة متبقّية وتطبيق منتظر)
+  const secs = await loadSections(env, true);
+  const eligible = [];
+  for (const s of secs) {
+    const quota = safeCount(s.quota, 5);
+    if (quota <= 0) continue;
+    const infl = await sectionInFlight(env, s.key);
+    if (infl >= quota) continue;
+    const groups = await targetGroups(env, s.key);
+    if (!groups.length) continue;                       // لا قناة مفعّلة تريد هذا القسم → تخطَّ
+    eligible.push({ key: s.key, name: s.name, quota, infl, ratio: infl / quota, groups });
+  }
+  if (!eligible.length) return 'idle';
+  // الخلط: اختر الأقل نسبةً (يوزّع بالتناوب)؛ التجميع: بترتيب الأقسام
+  eligible.sort((a, b) => mix ? (a.ratio - b.ratio) : 0);
+
+  for (const s of eligible) {
+    const next = await env.DB.prepare(
+      `SELECT * FROM queue WHERE section=? AND status='pending'
+         ORDER BY rank ASC, added_at ASC LIMIT 1`).bind(s.key).first();
+    if (!next) continue;
+
+    // مطالبة ذرّية (تمنع السباق): لا يُطلق إلا من ينجح في pending→processing
+    const claim = await env.DB.prepare(
+      "UPDATE queue SET status='processing', processing_at=? WHERE app_id=? AND status='pending'")
+      .bind(nowSec(), next.app_id).run();
+    if (!claim.meta || claim.meta.changes !== 1) continue;
+
+    const ok = await dispatchWorker(env, next, footer, s.groups);
+    if (!ok) {
+      await env.DB.prepare("UPDATE queue SET status='pending' WHERE app_id=?").bind(next.app_id).run();
+      await logEvent(env, 'error', `فشل إطلاق العامل ${next.app_id}`);
+      return 'dispatch_failed';
+    }
+    await logEvent(env, 'info', `${s.name}: ${next.name} (${next.app_id})`);
+    return `dispatched:${s.key}:${next.app_id}`;
+  }
+  return 'idle';
+}
+
+// يُنادى من العامل بعد نجاح النشر
+async function markPublished(env, app_id, name, version) {
+  const today = ksaDay();
+  // القسم من صف الطابور (قبل حذفه) — للعدّاد الساعي لكل قسم
+  const row = await env.DB.prepare('SELECT section FROM queue WHERE app_id=?').bind(app_id).first();
+  const section = row ? row.section : 'updates';
+  await env.DB.prepare('INSERT OR IGNORE INTO published(app_id,version,section,published_day,published_at) VALUES(?,?,?,?,?)')
+    .bind(app_id, version || '', section, today, nowSec()).run();
+  await env.DB.prepare('DELETE FROM queue WHERE app_id=?').bind(app_id).run();
+  await setSetting(env, 'last_publish_ts', nowSec());  // نبض النظام: آخر نشر ناجح
+  await setSetting(env, 'health_alerted', '0');         // صفّر تنبيه التوقف (النظام حيّ)
+  await logEvent(env, 'ok', `نُشر [${section}]: ${name || app_id}`);
+}
+
+// ---------- لوحة التحكم (أزرار البوت) ----------
+function fmtDur(sec) {
+  const m = Math.max(1, Math.round(sec / 60));
+  return m >= 60 ? `${Math.round(m / 60)} ساعة` : `${m} دقيقة`;
+}
+
+// الواجهة الأولى: اختيار القناة (زر لكل قناة) + الإعدادات العامة — زي «اختر المتجر»
+async function panelHome(env) {
+  const chans = (await env.DB.prepare('SELECT chat_id, name, enabled FROM channels ORDER BY added_at ASC').all()).results || [];
+  const kb = chans.map(c => [{ text: `${c.enabled ? '🟢' : '⚪️'} ${c.name || c.chat_id}`, callback_data: `ch_${c.chat_id}` }]);
+  kb.push([{ text: '⚙️ الإعدادات العامة', callback_data: 'global' }]);
+  kb.push([{ text: '🔄 تحديث', callback_data: 'home' }]);
+  const note = chans.length ? 'اختر القناة اللي تبي تديرها 👇' : 'ما فيه قنوات بعد — خلِّ البوت مشرفاً بقناتك وترجع هنا.';
+  const text = `<b>🗂️ اختر القناة</b>\n\n${note}\n\n<i>كل قناة لها لوحتها الخاصة (أقسامها، دايلبها، تنبيهاتها). و«⚙️ الإعدادات العامة» للتحكّم بالنظام كله.</i>`;
+  return { text, kb };
+}
+
+async function panelMain(env) {
+  const enabled = await getSetting(env, 'enabled', '1') === '1';
+  const pausedUntil = parseInt(await getSetting(env, 'paused_until', '0'), 10) || 0;
+  const paused = pausedUntil > nowSec();
+  const mix = (await getSetting(env, 'mix_mode', '0')) === '1';
+  const daily = (await getSetting(env, 'daily_summary', '0')) === '1';
+  const secs = await loadSections(env, false);
+  let total = 0;
+  const lines = [];
+  for (const s of secs) {
+    const q = (await env.DB.prepare("SELECT COUNT(*) c FROM queue WHERE section=? AND status='pending'").bind(s.key).first()).c;
+    const on = s.enabled ? '' : ' ⛔️';
+    if (s.enabled) total += safeCount(s.quota, 5);
+    lines.push(`${s.name}: ${s.quota}/ساعة  (بالطابور ${q})${on}`);
+  }
+  const todayCount = (await env.DB.prepare('SELECT COUNT(*) c FROM published WHERE published_day=?').bind(ksaDay()).first()).c;
+  // الحالة الواضحة: متوقف / موقوف مؤقتاً (مع الوقت المتبقي) / يعمل
+  const statusLine = !enabled ? '🔴 متوقف'
+    : paused ? `⏸️ موقوف مؤقتاً (باقي ${fmtDur(pausedUntil - nowSec())})`
+    : '🟢 يعمل';
+  const text =
+    `<b>🧠 لوحة تحكم النشر</b>\n\n` +
+    `الحالة: ${statusLine}\n` +
+    `النمط: ${mix ? '🔀 مخلوط' : '🗂️ مجمّع'}\n` +
+    `الإجمالي: ${total}/ساعة\n\n` +
+    lines.join('\n') +
+    `\n\nنُشر اليوم: ${todayCount}`;
+  const kb = [
+    [{ text: enabled ? '⏸️ إيقاف' : '▶️ تشغيل', callback_data: 'toggle' }],
+    [{ text: '🚀 نشر تطبيق فوراً', callback_data: 'pubnow' }],
+    [{ text: '🔢 الأقسام والأعداد', callback_data: 'secs' }, { text: '📋 الطابور', callback_data: 'queue' }],
+    [{ text: mix ? '🗂️ اجعله مجمّع' : '🔀 اجعله مخلوط', callback_data: 'mix' },
+     { text: daily ? '🔕 إيقاف الملخص اليومي' : '🔔 تفعيل الملخص اليومي', callback_data: 'daily' }],
+    [{ text: '👥 المشتركون', callback_data: 'subs' }, { text: '📊 التقرير', callback_data: 'report' }],
+    [{ text: '🕐 إيقاف مؤقت', callback_data: 'pause' }],
+    [{ text: '🚫 القائمة السوداء', callback_data: 'black' }, { text: '✍️ الفوتر', callback_data: 'footer' }],
+    [{ text: '📢 القنوات', callback_data: 'channels' }, { text: '📎 الدايلب', callback_data: 'dylibs' }],
+    [{ text: '📥 مصدر التطبيقات', callback_data: 'source' }],
+    [{ text: '👤 الملّاك', callback_data: 'owners' }, { text: '📖 دليل الاستخدام', callback_data: 'guide' }],
+    [{ text: '⬅️ اختر القناة', callback_data: 'home' }, { text: '🔄 تحديث', callback_data: 'global' }],
+  ];
+  return { text, kb };
+}
+
+async function handleCallback(env, cq) {
+  const data = cq.data;
+  const chatId = cq.message.chat.id;
+  const msgId = cq.message.message_id;
+  await tg(env, 'answerCallbackQuery', { callback_query_id: cq.id }); // يوقف مؤشّر التحميل على الزر
+  const edit = (text, kb) => tg(env, 'editMessageText', {
+    chat_id: chatId, message_id: msgId, text, parse_mode: 'HTML',
+    reply_markup: { inline_keyboard: kb }, disable_web_page_preview: true,
+  });
+  const back = [[{ text: '⬅️ رجوع', callback_data: 'global' }]];
+
+  if (data === 'home') { const p = await panelHome(env); return edit(p.text, p.kb); }      // اختيار القناة
+  if (data === 'global') { const p = await panelMain(env); return edit(p.text, p.kb); }     // الإعدادات العامة
+
+  // نشر فوري: اعرض تطبيقات الطابور بالاسم (أزرار) — اضغط واحداً ليُنشر الآن متخطياً الدور
+  if (data === 'pubnow') {
+    const rows = (await env.DB.prepare("SELECT app_id,name,version FROM queue WHERE status='pending' ORDER BY added_at DESC LIMIT 15").all()).results;
+    if (!rows.length) return edit('<b>🚀 نشر فوري</b>\n\nالطابور فاضي حالياً — انتظر المسح القادم ثم جرّب.', back);
+    const kb = rows.map(r => [{ text: `${r.name || 'تطبيق'}${r.version ? ' ' + r.version : ''}`.slice(0, 60), callback_data: `pub_${r.app_id}` }]);
+    kb.push(...back);
+    return edit('<b>🚀 نشر فوري</b>\nاضغط التطبيق اللي تبي تنشره الحين (يتخطّى الدور):', kb);
+  }
+  const pn = data.match(/^pub_([A-Za-z0-9-]+)$/);
+  if (pn) {
+    const id = pn[1];
+    const app = await env.DB.prepare("SELECT * FROM queue WHERE app_id=? AND status='pending'").bind(id).first();
+    if (!app) return edit('⚠️ هذا التطبيق ما عاد بالطابور (نُشر أو أُزيل).', back);
+    // مطالبة ذرّية ثم إطلاق فوري بغضّ النظر عن حدّ القسم
+    const groups = await targetGroups(env, app.section);
+    if (!groups.length) return edit('⚠️ ما فيه قناة مفعّلة تستقبل قسم هذا التطبيق.\nفعّل قناة واربطها بالقسم من «📢 القنوات».', back);
+    const claim = await env.DB.prepare("UPDATE queue SET status='processing', processing_at=? WHERE app_id=? AND status='pending'").bind(nowSec(), id).run();
+    if (!claim.meta || claim.meta.changes !== 1) return edit('⚠️ يُعالَج بالفعل الآن.', back);
+    const ok = await dispatchWorker(env, app, await getSetting(env, 'footer', ''), groups);
+    if (!ok) {
+      await env.DB.prepare("UPDATE queue SET status='pending' WHERE app_id=?").bind(id).run();
+      return edit('❌ تعذّر الإطلاق، جرّب بعد لحظات.', back);
+    }
+    await logEvent(env, 'info', `نشر فوري: ${app.name || id}`);
+    return edit(`🚀 <b>يُنشر الآن:</b> ${H(app.name || id)}\n\nبيوصل القناة خلال دقيقة ✅`, back);
+  }
+
+  // حظر فوري من زر تنبيه التخطّي (بالاسم)
+  const bk = data.match(/^blk_([A-Za-z0-9-]+)$/);
+  if (bk) {
+    const id = bk[1];
+    const q = await env.DB.prepare('SELECT name FROM queue WHERE app_id=?').bind(id).first();
+    const nm = q && q.name ? q.name : id;
+    await env.DB.prepare('INSERT OR IGNORE INTO blacklist(app_id,name) VALUES(?,?)').bind(id, nm).run();
+    await env.DB.prepare('DELETE FROM queue WHERE app_id=?').bind(id).run();
+    return edit(`⛔ حُظر: ${H(nm)}\n\nما عاد ينشر إطلاقاً.`, back);
+  }
+
+  if (data === 'toggle') {
+    const cur = await getSetting(env, 'enabled', '1');
+    await setSetting(env, 'enabled', cur === '1' ? '0' : '1');
+    const p = await panelMain(env); return edit(p.text, p.kb);
+  }
+
+  if (data === 'mix') {
+    const cur = await getSetting(env, 'mix_mode', '0');
+    await setSetting(env, 'mix_mode', cur === '1' ? '0' : '1');
+    const p = await panelMain(env); return edit(p.text, p.kb);
+  }
+  if (data === 'daily') {
+    const cur = await getSetting(env, 'daily_summary', '0');
+    await setSetting(env, 'daily_summary', cur === '1' ? '0' : '1');
+    const p = await panelMain(env); return edit(p.text, p.kb);
+  }
+
+  if (data === 'queue') {
+    let body = '';
+    for (const s of await loadSections(env, false)) {
+      const rows = (await env.DB.prepare("SELECT name,version FROM queue WHERE section=? AND status='pending' ORDER BY rank ASC, added_at ASC LIMIT 4").bind(s.key).all()).results;
+      body += `\n<b>${s.name}</b>\n` + (rows.length ? rows.map(r => `• ${H(r.name)} ${H(r.version || '')}`).join('\n') : '—') + '\n';
+    }
+    return edit(`<b>📋 الطابور (أوائل كل قسم)</b>\n${body}`, [
+      [{ text: '🗑️ تفريغ الطابور', callback_data: 'queue_clear' }], ...back]);
+  }
+  if (data === 'queue_clear') {
+    await env.DB.prepare("DELETE FROM queue WHERE status='pending'").run();
+    return edit('✅ فُرّغ الطابور.', back);
+  }
+
+  if (data === 'subs') {
+    const chans = (await env.DB.prepare('SELECT chat_id, name, username FROM channels WHERE enabled=1').all()).results || [];
+    if (!chans.length) return edit('<b>👥 المشتركون</b>\n\nما فيه قنوات مفعّلة.', [[{ text: '🔄 تحديث', callback_data: 'subs' }], ...back]);
+    const lines = [];
+    for (const c of chans) {
+      const cnt = await getSubscriberCount(env, c.username || c.chat_id);
+      if (cnt == null) { lines.push(`⚠️ ${H(c.name)}: تعذّر (تأكد البوت مشرف)`); continue; }
+      let hist = [];
+      try { hist = JSON.parse(await getSetting(env, 'subs_hist_' + c.chat_id, '[]')) || []; } catch { hist = []; }
+      const prev = hist.length ? hist[hist.length - 1].c : 0;
+      const g = prev ? cnt - prev : 0;
+      const arrow = !prev ? '' : g > 0 ? ` (+${g} ▲)` : g < 0 ? ` (${g} ▼)` : '';
+      lines.push(`👥 <b>${H(c.name)}</b>: ${cnt}${arrow}`);
+    }
+    return edit(`<b>👥 مشتركو قنواتك</b>\n\n${lines.join('\n')}`, [[{ text: '🔄 تحديث', callback_data: 'subs' }], ...back]);
+  }
+
+  if (data === 'report') {
+    const today = (await env.DB.prepare('SELECT COUNT(*) c FROM published WHERE published_day=?').bind(ksaDay()).first()).c;
+    const errs = (await env.DB.prepare("SELECT msg FROM log WHERE kind='error' ORDER BY id DESC LIMIT 3").all()).results;
+    // أسماء آخر ما نُشر تُقرأ من سجل الأحداث (kind='ok' = "نُشر [قسم]: الاسم")
+    const last = (await env.DB.prepare("SELECT msg FROM log WHERE kind='ok' ORDER BY id DESC LIMIT 5").all()).results;
+    const lastTxt = last.map(r => `• ${H(r.msg)}`).join('\n') || '—';
+    const errTxt = errs.length ? '\n\n⚠️ آخر أخطاء:\n' + errs.map(e => '• ' + H(e.msg)).join('\n') : '';
+    return edit(`<b>📊 التقرير</b>\n\nنُشر اليوم: ${today}\n\nآخر ما نُشر:\n${lastTxt}${errTxt}`, back);
+  }
+
+  // قائمة الأقسام (تعديل/تفعيل/حذف/إضافة)
+  if (data === 'secs') {
+    const secs = await loadSections(env, false);
+    const pages = parseInt(await getSetting(env, 'scan_pages', '3'), 10) || 3;
+    const kb = secs.map(s => [{ text: `${s.enabled ? '' : '⛔️ '}${s.name}: ${s.quota}/ساعة`, callback_data: `sec_${s.key}` }]);
+    kb.push([{ text: '➕ أضف قسم', callback_data: 'addsec' }]);
+    kb.push([{ text: `📄 صفحات المسح لكل قسم: ${pages}`, callback_data: 'pages' }]);
+    kb.push(...back);
+    return edit('<b>🔢 الأقسام والأعداد</b>\nاختر قسماً لتعديله، أو أضف قسماً، أو اضبط عدد صفحات المسح:', kb);
+  }
+  if (data === 'pages') {
+    const pages = parseInt(await getSetting(env, 'scan_pages', '3'), 10) || 3;
+    const opts = [1, 2, 3, 5, 7, 10];
+    const kb = [opts.map(n => ({ text: `${n === pages ? '✅ ' : ''}${n}`, callback_data: `setpages_${n}` }))];
+    kb.push([{ text: '⬅️ الأقسام', callback_data: 'secs' }]);
+    return edit(`<b>📄 صفحات المسح</b>\nكم صفحة يسحب من كل تصنيف؟ (الحالي: ${pages})\n\nأكثر صفحات = تطبيقات أقدم أكثر توصل للطابور، بس المسح يصير أبطأ.`, kb);
+  }
+  const spm = data.match(/^setpages_(\d+)$/);
+  if (spm) {
+    const n = Math.min(20, Math.max(1, parseInt(spm[1], 10)));
+    await setSetting(env, 'scan_pages', String(n));
+    return edit(`✅ صار يسحب <b>${n}</b> ${n === 1 ? 'صفحة' : 'صفحات'} من كل قسم (يبدأ بالمسح الجاي).`, [[{ text: '⬅️ الأقسام', callback_data: 'secs' }]]);
+  }
+  // إدارة قسم محدد
+  const secm = data.match(/^sec_([a-z0-9]+)$/);
+  if (secm && await sectionExists(env, secm[1])) {
+    const key = secm[1];
+    const s = await env.DB.prepare('SELECT * FROM sections WHERE key=?').bind(key).first();
+    const opts = [0, 3, 5, 8, 10, 15, 20];
+    const kb = [
+      opts.slice(0, 4).map(n => ({ text: String(n), callback_data: `setsec_${key}_${n}` })),
+      opts.slice(4).map(n => ({ text: String(n), callback_data: `setsec_${key}_${n}` })),
+      [{ text: '✏️ رقم مخصّص', callback_data: `numsec_${key}` }],
+      [{ text: s.enabled ? '⛔️ إيقاف القسم' : '✅ تفعيل القسم', callback_data: `toggsec_${key}` }],
+    ];
+    kb.push([{ text: '🗑️ حذف القسم', callback_data: `delsec_${key}` }]);
+    kb.push([{ text: '⬅️ الأقسام', callback_data: 'secs' }]);
+    return edit(`<b>${s.name}</b>\nالعدد الحالي: ${s.quota}/ساعة\nاختر رقماً، أو «✏️ رقم مخصّص» لأي رقم:`, kb);
+  }
+  // وضع انتظار: أرسل رقماً فيصير عدد القسم
+  const nm = data.match(/^numsec_([a-z0-9]+)$/);
+  if (nm && await sectionExists(env, nm[1])) {
+    await setSetting(env, 'await', 'num:' + nm[1]);
+    return edit(`✏️ أرسل الآن الرقم اللي تبيه لعدد <b>${await sectionName(env, nm[1])}</b> بالساعة:`, [[{ text: '⬅️ رجوع', callback_data: `sec_${nm[1]}` }]]);
+  }
+  // حفظ عدد قسم
+  const ms = data.match(/^setsec_([a-z0-9]+)_(\d+)$/);
+  if (ms && await sectionExists(env, ms[1])) {
+    await env.DB.prepare('UPDATE sections SET quota=? WHERE key=?').bind(safeCount(ms[2], 5), ms[1]).run();
+    const p = await panelMain(env); return edit(p.text, p.kb);
+  }
+  // تفعيل/إيقاف قسم
+  const tg2 = data.match(/^toggsec_([a-z0-9]+)$/);
+  if (tg2 && await sectionExists(env, tg2[1])) {
+    await env.DB.prepare('UPDATE sections SET enabled=1-enabled WHERE key=?').bind(tg2[1]).run();
+    const p = await panelMain(env); return edit(p.text, p.kb);
+  }
+  // حذف قسم + إزالة تطبيقاته المنتظرة
+  const dl = data.match(/^delsec_([a-z0-9]+)$/);
+  if (dl && await sectionExists(env, dl[1])) {
+    await env.DB.prepare('DELETE FROM sections WHERE key=?').bind(dl[1]).run();
+    await env.DB.prepare("DELETE FROM queue WHERE section=? AND status='pending'").bind(dl[1]).run();
+    const p = await panelMain(env); return edit('🗑️ حُذف القسم.', p.kb);
+  }
+  // إضافة قسم — أزرار جاهزة للأقسام المتاحة (اضغط بس، بلا كتابة)
+  if (data === 'addsec') {
+    const existingPaths = new Set((await loadSections(env, false)).map(s => s.path));
+    const avail = CATALOG.filter(c => !existingPaths.has(c.id));   // path = uuid التصنيف
+    if (!avail.length) return edit('<b>➕ أضف قسم</b>\n\nكل الأقسام مُضافة بالفعل ✅', [[{ text: '⬅️ الأقسام', callback_data: 'secs' }]]);
+    const kb = avail.map(c => [{ text: `${c.name}`, callback_data: `addcat_${c.key}` }]);
+    kb.push([{ text: '⬅️ الأقسام', callback_data: 'secs' }]);
+    return edit('<b>➕ أضف قسم</b>\nاضغط القسم اللي تبي تضيفه (٥/ساعة افتراضياً، غيّره بعدها):', kb);
+  }
+  // تنفيذ الإضافة بضغطة
+  const ac = data.match(/^addcat_([a-z]+)$/);
+  if (ac) {
+    const c = CATALOG.find(x => x.key === ac[1]);
+    if (c) {
+      const ord = ((await env.DB.prepare('SELECT MAX(ord) mx FROM sections').first()).mx || 0) + 1;
+      await env.DB.prepare('INSERT OR REPLACE INTO sections(key,name,path,quota,enabled,ord) VALUES(?,?,?,?,1,?)')
+        .bind(c.key, c.name, c.id, 5, ord).run();   // path = uuid التصنيف
+    }
+    const p = await panelMain(env); return edit('✅ أُضيف القسم (سيبدأ بالمسح التالي).', p.kb);
+  }
+
+  if (data === 'pause') {
+    const pu = parseInt(await getSetting(env, 'paused_until', '0'), 10) || 0;
+    const nowState = pu > nowSec() ? `⏸️ موقوف مؤقتاً حالياً — باقي ${fmtDur(pu - nowSec())}` : '🟢 النشر يعمل الآن (غير موقوف)';
+    const kb = [[{ text: 'ساعة', callback_data: 'pause_1' }, { text: '3 ساعات', callback_data: 'pause_3' }, { text: 'يوم', callback_data: 'pause_24' }],
+                [{ text: '▶️ إلغاء الإيقاف المؤقت', callback_data: 'pause_0' }], ...back];
+    return edit(`<b>🕐 إيقاف مؤقت للنشر</b>\n\n${nowState}\n\nاختر مدة الإيقاف، أو ألغِه:`, kb);
+  }
+  if (data.startsWith('pause_')) {
+    const h = parseInt(data.split('_')[1], 10);
+    await setSetting(env, 'paused_until', h ? nowSec() + h * 3600 : 0);
+    const p = await panelMain(env);
+    return edit(h ? `⏸️ تم الإيقاف المؤقت ${fmtDur(h * 3600)}. (شوف الحالة فوق)` : '▶️ أُلغي الإيقاف — النشر يعمل الآن.', p.kb);
+  }
+
+  // 👤 إدارة الملّاك — عرض القائمة، كل مالك جنبه زر حذف (يُمنع حذف الأخير)
+  if (data === 'owners') {
+    const owners = await getOwners(env);
+    const me = String(cq.from.id);
+    const rows = owners.map(id => (owners.length > 1
+      ? [{ text: `🗑️ ${id}${id === me ? ' (أنت)' : ''}`, callback_data: `delowner_${id}` }]
+      : [{ text: `${id}${id === me ? ' (أنت)' : ''}`, callback_data: 'owners' }]));
+    rows.push([{ text: '➕ أضف مالك', callback_data: 'addowner' }]);
+    rows.push(...back);
+    return edit('<b>👤 ملّاك البوت</b>\nكل رقم يتحكّم بالبوت كامل.\nاضغط 🗑️ لإزالة مالك (ما يمكن إزالة الأخير):', rows);
+  }
+  const dow = data.match(/^delowner_(\d+)$/);
+  if (dow) {
+    const id = dow[1];
+    let owners = await getOwners(env);
+    if (owners.length <= 1) return edit('⚠️ لا يمكن إزالة المالك الوحيد.', [[{ text: '⬅️ رجوع', callback_data: 'owners' }]]);
+    owners = owners.filter(x => x !== id);
+    await setOwners(env, owners);
+    if (id === String(cq.from.id)) {
+      // أزال نفسه — يطلع من البوت (بلا لوحة)
+      return edit('✅ طلعت من البوت — ما عاد لك تحكّم.\n\nإذا حبيت ترجع، صاحب البوت يقدر يضيفك.', []);
+    }
+    const me = String(cq.from.id);
+    const rows = owners.map(x => (owners.length > 1
+      ? [{ text: `🗑️ ${x}${x === me ? ' (أنت)' : ''}`, callback_data: `delowner_${x}` }]
+      : [{ text: `${x}${x === me ? ' (أنت)' : ''}`, callback_data: 'owners' }]));
+    rows.push([{ text: '➕ أضف مالك', callback_data: 'addowner' }]);
+    rows.push(...back);
+    return edit(`✅ أُزيل المالك ${H(id)}.\n\n<b>👤 ملّاك البوت</b>`, rows);
+  }
+  if (data === 'addowner') {
+    await setSetting(env, 'await', 'addowner');
+    return edit('➕ أرسل الآن رقم تلقرام الرقمي للمالك الجديد.\n(يجيبه من بوت @userinfobot):', [[{ text: '⬅️ رجوع', callback_data: 'owners' }]]);
+  }
+
+  // ═══ 📢 القنوات ═══
+  if (data === 'channels') {
+    const chans = (await env.DB.prepare('SELECT chat_id,name,enabled FROM channels ORDER BY added_at ASC').all()).results || [];
+    const kb = chans.map(c => [{ text: `${c.enabled ? '🟢' : '⚪️'} ${c.name || c.chat_id}`, callback_data: `ch_${c.chat_id}` }]);
+    kb.push(...back);
+    const note = chans.length ? 'اختر قناة لإدارتها (تفعيل + أقسامها):' : 'ما فيه قنوات بعد.';
+    return edit(`<b>📢 القنوات</b>\n${note}\n\n<i>لإضافة قناة: خلِّ البوت مشرفاً فيها، وتظهر هنا تلقائياً.</i>`, kb);
+  }
+  const chsecm = data.match(/^chsec_(-?\d+)_([a-z0-9]+)$/);
+  if (chsecm) {
+    const cid = chsecm[1], sk = chsecm[2];
+    const ex = await env.DB.prepare('SELECT 1 FROM channel_sections WHERE chat_id=? AND section_key=?').bind(cid, sk).first();
+    if (ex) await env.DB.prepare('DELETE FROM channel_sections WHERE chat_id=? AND section_key=?').bind(cid, sk).run();
+    else await env.DB.prepare('INSERT OR IGNORE INTO channel_sections(chat_id,section_key) VALUES(?,?)').bind(cid, sk).run();
+    const v = await channelView(env, cid);
+    return v ? edit(v.text, v.kb) : edit('⚠️ القناة ما عادت موجودة.', [[{ text: '⬅️ القنوات', callback_data: 'channels' }]]);
+  }
+  const chtogm = data.match(/^chtog_(-?\d+)$/);
+  if (chtogm) {
+    await env.DB.prepare('UPDATE channels SET enabled=1-enabled WHERE chat_id=?').bind(chtogm[1]).run();
+    const v = await channelView(env, chtogm[1]);
+    return v ? edit(v.text, v.kb) : edit('⚠️ القناة ما عادت موجودة.', [[{ text: '⬅️ القنوات', callback_data: 'channels' }]]);
+  }
+  const chdelm = data.match(/^chdel_(-?\d+)$/);
+  if (chdelm) {
+    await env.DB.prepare('DELETE FROM channels WHERE chat_id=?').bind(chdelm[1]).run();
+    await env.DB.prepare('DELETE FROM channel_sections WHERE chat_id=?').bind(chdelm[1]).run();
+    return edit('🗑️ حُذفت القناة.', [[{ text: '⬅️ القنوات', callback_data: 'channels' }]]);
+  }
+  // اختيار دايلب لقناة (عرض القائمة + الافتراضي العام)
+  const chdylsetm = data.match(/^chdylset_(-?\d+)_(\d+)$/);
+  if (chdylsetm) {
+    const cid = chdylsetm[1], rid = chdylsetm[2];
+    let name = '';
+    if (rid !== '0') {
+      const r = await env.DB.prepare('SELECT name FROM dylibs WHERE rowid=?').bind(rid).first();
+      name = r ? r.name : '';
+    }
+    await env.DB.prepare('UPDATE channels SET dylib=? WHERE chat_id=?').bind(name || null, cid).run();
+    const v = await channelView(env, cid);
+    return v ? edit(v.text, v.kb) : edit('⚠️ القناة ما عادت موجودة.', [[{ text: '⬅️ القنوات', callback_data: 'channels' }]]);
+  }
+  const chdylm = data.match(/^chdyl_(-?\d+)$/);
+  if (chdylm) {
+    const cid = chdylm[1];
+    const rows = (await env.DB.prepare('SELECT rowid AS id,name FROM dylibs ORDER BY added_at DESC').all()).results || [];
+    const c = await env.DB.prepare('SELECT dylib FROM channels WHERE chat_id=?').bind(cid).first();
+    const cur = c ? (c.dylib || '') : '';
+    const kb = [[{ text: `${!cur ? '✅' : '⬜️'} الافتراضي العام`, callback_data: `chdylset_${cid}_0` }]];
+    for (const r of rows) kb.push([{ text: `${r.name === cur ? '✅' : '⬜️'} ${r.name}`, callback_data: `chdylset_${cid}_${r.id}` }]);
+    kb.push([{ text: '⬅️ رجوع', callback_data: `ch_${cid}` }]);
+    return edit('<b>📎 دايلب هذه القناة</b>\nاختر الدايلب المحقون بتطبيقات هالقناة:', kb);
+  }
+  const chownsetm = data.match(/^chownset_(-?\d+)_(\d+)$/);
+  if (chownsetm) {
+    const cid = chownsetm[1], oid = chownsetm[2];
+    await env.DB.prepare('UPDATE channels SET owner=? WHERE chat_id=?').bind(oid === '0' ? null : oid, cid).run();
+    const v = await channelView(env, cid);
+    return v ? edit(v.text, v.kb) : edit('⚠️ القناة ما عادت موجودة.', [[{ text: '⬅️ القنوات', callback_data: 'channels' }]]);
+  }
+  const chownm = data.match(/^chown_(-?\d+)$/);
+  if (chownm) {
+    const cid = chownm[1];
+    const me = String(cq.from.id);
+    const cr = await env.DB.prepare('SELECT owner FROM channels WHERE chat_id=?').bind(cid).first();
+    const cur = cr && cr.owner ? cr.owner : '';
+    const kb = [[{ text: `${!cur ? '✅' : '⬜️'} الكل (بلا تخصيص)`, callback_data: `chownset_${cid}_0` }]];
+    for (const o of await getOwners(env)) kb.push([{ text: `${o === cur ? '✅' : '⬜️'} ${o}${o === me ? ' (أنت)' : ''}`, callback_data: `chownset_${cid}_${o}` }]);
+    kb.push([{ text: '⬅️ رجوع', callback_data: `ch_${cid}` }]);
+    return edit('<b>🔔 مالك تنبيهات هذه القناة</b>\nمين توصله تنبيهاتها (مشتركين/معالم/هبوط)؟\n<i>«الكل» = توصل الاثنين.</i>', kb);
+  }
+  const chfootm = data.match(/^chfoot_(-?\d+)$/);
+  if (chfootm) {
+    const cid = chfootm[1];
+    const cr = await env.DB.prepare('SELECT name, footer FROM channels WHERE chat_id=?').bind(cid).first();
+    await setSetting(env, 'await', 'chfoot:' + cid);
+    return edit(`✏️ أرسل النص الخاص بقناة «${H(cr && cr.name || cid)}» (يظهر أسفل كل منشور).\nالحالي: ${H(cr && cr.footer || 'النص العام')}\n<i>أرسل «-» لإرجاعها للنص العام.</i>`, [[{ text: '⬅️ رجوع', callback_data: `ch_${cid}` }]]);
+  }
+  const chm = data.match(/^ch_(-?\d+)$/);
+  if (chm) {
+    const v = await channelView(env, chm[1]);
+    return v ? edit(v.text, v.kb) : edit('⚠️ القناة ما عادت موجودة.', [[{ text: '⬅️ القنوات', callback_data: 'channels' }]]);
+  }
+
+  // ═══ 📎 الدايلب ═══
+  if (data === 'dylibs') {
+    const v = await dylibsView(env);
+    return edit(v.text, [...v.kb, ...back]);
+  }
+  const dylrenm = data.match(/^dylren_(\d+)$/);
+  if (dylrenm) {
+    const r = await env.DB.prepare('SELECT name FROM dylibs WHERE rowid=?').bind(dylrenm[1]).first();
+    if (!r) return edit('⚠️ الدايلب ما عاد موجوداً.', [[{ text: '⬅️ الدايلب', callback_data: 'dylibs' }]]);
+    await setSetting(env, 'await', 'dylren:' + dylrenm[1]);
+    return edit(`✏️ أرسل الاسم الجديد للدايلب «${H(r.name)}»:`, [[{ text: '⬅️ الدايلب', callback_data: 'dylibs' }]]);
+  }
+  const dyldelm = data.match(/^dyldel_(\d+)$/);
+  if (dyldelm) {
+    const r = await env.DB.prepare('SELECT name FROM dylibs WHERE rowid=?').bind(dyldelm[1]).first();
+    if (r) {
+      await env.DYLIBS.delete(r.name);
+      await env.DB.prepare('DELETE FROM dylibs WHERE rowid=?').bind(dyldelm[1]).run();
+      if (await getSetting(env, 'dylib_active', '') === r.name) await setSetting(env, 'dylib_active', '');
+    }
+    const v = await dylibsView(env);
+    return edit(v.text, [...v.kb, ...back]);
+  }
+  const dylm = data.match(/^dyl_(\d+)$/);
+  if (dylm) {
+    const r = await env.DB.prepare('SELECT name FROM dylibs WHERE rowid=?').bind(dylm[1]).first();
+    if (r) await setSetting(env, 'dylib_active', r.name);
+    const v = await dylibsView(env);
+    return edit(v.text, [...v.kb, ...back]);
+  }
+
+  if (data === 'guide') {
+    const g =
+`<b>📖 دليل استخدام البوت</b>
+
+<b>▸ التحكم</b>
+⏸️ إيقاف/تشغيل — يوقف أو يكمّل النشر (الطابور محفوظ)
+🕐 إيقاف مؤقت — يوقف لمدة تختارها ثم يرجع وحده
+🚀 نشر فوراً — اختر تطبيقاً بالاسم يُنشر الآن متخطياً الدور
+
+<b>▸ الأقسام</b>
+🔢 الأقسام والأعداد — كم تطبيق/ساعة لكل قسم (٠ = إيقاف القسم) + إضافة/حذف
+📋 الطابور — المنتظرون بكل قسم + تفريغ
+🔀 مخلوط / 🗂️ مجمّع — يوزّع النشر بالتناوب أو قسماً قسماً
+
+<b>▸ المتابعة</b>
+👥 المشتركون — العدد + رسم ٧ أيام + النمو + توقّع
+📊 التقرير — نُشر اليوم + آخر ما نُشر + آخر الأخطاء (عربي)
+🔔 الملخص اليومي — تقرير كل ليلة
+
+<b>▸ القنوات والدايلب</b>
+📢 القنوات — أضف البوت مشرفاً بأي قناة فتظهر تلقائياً؛ فعّلها واختر أقسامها (كل قناة محتواها)
+📎 الدايلب — أرسل ملف .dylib للبوت هنا فيُخزَّن باسمه؛ اضغط أي واحد ليصير الفعّال المحقون
+
+<b>▸ الإدارة</b>
+🚫 القائمة السوداء — الممنوعون (يُحظر بزر «⛔ احظره» مع أي تنبيه)
+✍️ الفوتر — النص الثابت أسفل كل منشور
+👤 الملّاك — إضافة/إزالة من يتحكّم بالبوت
+
+<b>▸ تنبيهات تلقائية توصلك</b>
+🔴 لو النشر توقّف • 🎉 عند كل معلم مشتركين • 📉 عند هبوط • 🗓️ تقرير كل جمعة
+
+<i>كل شي آلي — البوت يسحب ويحقن وينشر وحده ٢٤ ساعة، بدون جهازك.</i>`;
+    return edit(g, back);
+  }
+
+  if (data === 'black') {
+    const rows = (await env.DB.prepare('SELECT name,app_id FROM blacklist LIMIT 20').all()).results;
+    const body = rows.length ? rows.map(r => `• ${H(r.name || r.app_id)}`).join('\n') : 'فاضية';
+    return edit(`<b>🚫 القائمة السوداء</b>\n\n${body}\n\nللحظر: اضغط زر «⛔ احظره» اللي يجيك مع تنبيه أي تطبيق.`, back);
+  }
+  if (data === 'footer') {
+    const f = await getSetting(env, 'footer', '');
+    await setSetting(env, 'await', 'footer');  // الرسالة التالية = الفوتر الجديد
+    return edit(`<b>✍️ فوتر المنشور</b>\n\nالحالي:\n${H(f) || '(فاضي)'}\n\n✏️ أرسل الآن النص الجديد للفوتر (أو «-» لمسحه).`, back);
+  }
+
+  // ═══ 📥 مصدر التطبيقات ═══
+  if (data === 'source') {
+    const v = await sourceView(env);
+    return edit(v.text, v.kb);
+  }
+  if (data === 'srctog') {
+    const cur = (await getSetting(env, 'tg_source_enabled', '0')) === '1';
+    await setSetting(env, 'tg_source_enabled', cur ? '0' : '1');
+    const v = await sourceView(env);
+    return edit(v.text, v.kb);
+  }
+  if (data === 'srclim') {
+    await setSetting(env, 'await', 'srclim');
+    return edit('🔢 أرسل عدد التطبيقات لكل تشغيل (كل 10 دقائق)، رقم من 1 إلى 20:', [[{ text: '⬅️ رجوع', callback_data: 'source' }]]);
+  }
+}
+
+async function handleMessage(env, msg) {
+  // ادعم الرسائل المُحوّلة/الصور (نصها في caption لا text)
+  const text = (msg.text || msg.caption || '').trim();
+  const reply = (t) => tg(env, 'sendMessage', { chat_id: msg.chat.id, text: t });
+  if (text === '/start' || text === '/panel' || text === 'لوحة' || text === '🧠 لوحتي') {
+    await setSetting(env, 'await', '');  // أي ضغطة على اللوحة تلغي وضع الانتظار
+    const p = await panelHome(env);      // الواجهة الأولى = اختيار القناة
+    // زر ثابت «🧠 لوحتي» يظهر جنب مربع الكتابة — اضغطه أي وقت بدل ما تكتب /start
+    await tg(env, 'sendMessage', {
+      chat_id: msg.chat.id, text: 'اضغط «🧠 لوحتي» أي وقت لفتح اللوحة.',
+      reply_markup: { keyboard: [[{ text: '🧠 لوحتي' }]], resize_keyboard: true, is_persistent: true },
+    });
+    return tg(env, 'sendMessage', { chat_id: msg.chat.id, text: p.text, parse_mode: 'HTML', reply_markup: { inline_keyboard: p.kb } });
+  }
+  // استقبال ملف دايلب: يُخزَّن باسمه بمخزن KV ويُسجَّل بالجدول
+  if (msg.document) {
+    const doc = msg.document;
+    const fname = (doc.file_name || '').trim();
+    if (!/\.dylib$/i.test(fname)) return reply('❌ أرسل ملفاً بامتداد .dylib');
+    if (doc.file_size && doc.file_size > 20 * 1024 * 1024) return reply('❌ الملف كبير (أقصى 20 ميجا للبوت).');
+    const gf = await tg(env, 'getFile', { file_id: doc.file_id });
+    if (!gf.ok || !gf.result || !gf.result.file_path) return reply('❌ تعذّر جلب الملف من تلقرام.');
+    const fresp = await fetch(`https://api.telegram.org/file/bot${env.TG_BOT_TOKEN}/${gf.result.file_path}`);
+    if (!fresp.ok) return reply('❌ تعذّر تنزيل الملف.');
+    const buf = await fresp.arrayBuffer();
+    await env.DYLIBS.put(fname, buf);
+    await env.DB.prepare('INSERT OR REPLACE INTO dylibs(name,size,added_at) VALUES(?,?,?)').bind(fname, buf.byteLength, nowSec()).run();
+    const active = await getSetting(env, 'dylib_active', '');
+    if (!active) await setSetting(env, 'dylib_active', fname);
+    return reply(`✅ حُفظ الدايلب «${fname}» (${Math.round(buf.byteLength / 1024)} ك.ب).${active ? '\nفعّله من «📎 الدايلب».' : '\nصار هو الفعّال المحقون.'}`);
+  }
+
+  const awaiting = await getSetting(env, 'await', '');
+  // وضع انتظار الفوتر: الرسالة التالية بعد ضغط «الفوتر» تصير الفوتر
+  if (awaiting === 'footer') {
+    await setSetting(env, 'await', '');
+    await setSetting(env, 'footer', text === '-' ? '' : text);
+    return reply(text === '-' ? '✅ مُسح الفوتر.' : '✅ حُدّث الفوتر.');
+  }
+  // وضع انتظار عدد «كل تشغيل» لمصدر التطبيقات
+  if (awaiting === 'srclim') {
+    await setSetting(env, 'await', '');
+    const n = parseInt(text, 10);
+    if (!(n >= 1 && n <= 20)) return reply('❌ أرسل رقماً من 1 إلى 20.');
+    await setSetting(env, 'tg_source_limit', String(n));
+    return reply(`✅ صار المصدر يسحب ${n} تطبيق كل تشغيل (كل 10 دقائق).`);
+  }
+  // وضع انتظار نص قناة معيّنة: الرسالة التالية = فوتر تلك القناة (- = النص العام)
+  if (awaiting.startsWith('chfoot:')) {
+    await setSetting(env, 'await', '');
+    const cid = awaiting.slice(7);
+    const val = text === '-' ? null : text;
+    const res = await env.DB.prepare('UPDATE channels SET footer=? WHERE chat_id=?').bind(val, cid).run();
+    if (!res.meta || res.meta.changes !== 1) return reply('⚠️ القناة ما عادت موجودة.');
+    return reply(val === null ? '✅ رجّعت القناة للنص العام.' : '✅ حُدّث نص القناة.');
+  }
+  // وضع انتظار رقم لقسم: الرسالة التالية (رقم) تصير عدد القسم
+  if (awaiting.startsWith('num:')) {
+    const key = awaiting.slice(4);
+    await setSetting(env, 'await', '');
+    if (!/^\d+$/.test(text) || !(await sectionExists(env, key))) return reply('❌ أرسل رقماً صحيحاً.');
+    await env.DB.prepare('UPDATE sections SET quota=? WHERE key=?').bind(safeCount(text, 5), key).run();
+    return reply(`✅ عدد ${await sectionName(env, key)} = ${safeCount(text, 5)}/ساعة.`);
+  }
+  // إضافة مالك جديد: الرسالة التالية بعد «➕ أضف مالك» = رقمه
+  if (awaiting === 'addowner') {
+    await setSetting(env, 'await', '');
+    if (!/^\d{5,}$/.test(text)) return reply('❌ أرسل رقماً صحيحاً (أرقام فقط، من @userinfobot).');
+    const owners = await getOwners(env);
+    if (owners.includes(text)) return reply('ℹ️ هذا الرقم مالك بالفعل.');
+    owners.push(text);
+    await setOwners(env, owners);
+    return reply(`✅ أُضيف المالك ${text}. صار يقدر يفتح البوت ويتحكم.`);
+  }
+  // إعادة تسمية دايلب: ينقل الملف بمخزن KV للاسم الجديد + يحدّث الفعّال والقنوات المرتبطة
+  if (awaiting.startsWith('dylren:')) {
+    await setSetting(env, 'await', '');
+    const rid = awaiting.slice(7);
+    const row = await env.DB.prepare('SELECT name FROM dylibs WHERE rowid=?').bind(rid).first();
+    if (!row) return reply('❌ الدايلب ما عاد موجوداً.');
+    let newName = text.trim();
+    if (!newName || newName.length > 60) return reply('❌ اسم غير صالح (1–60 حرف).');
+    if (!/\.dylib$/i.test(newName)) newName += '.dylib';
+    if (newName === row.name) return reply('ℹ️ نفس الاسم الحالي.');
+    const clash = await env.DB.prepare('SELECT 1 FROM dylibs WHERE name=? AND rowid<>?').bind(newName, rid).first();
+    if (clash) return reply('❌ فيه دايلب ثاني بنفس الاسم.');
+    const data = await env.DYLIBS.get(row.name, 'arrayBuffer');
+    if (data) { await env.DYLIBS.put(newName, data); await env.DYLIBS.delete(row.name); }
+    await env.DB.prepare('UPDATE dylibs SET name=? WHERE rowid=?').bind(newName, rid).run();
+    if (await getSetting(env, 'dylib_active', '') === row.name) await setSetting(env, 'dylib_active', newName);
+    await env.DB.prepare('UPDATE channels SET dylib=? WHERE dylib=?').bind(newName, row.name).run();
+    return reply(`✅ صار اسمه «${newName}».`);
+  }
+  if (text.startsWith('فوتر:')) {
+    await setSetting(env, 'footer', text.slice(5).trim());
+    return reply('✅ حُدّث الفوتر.');
+  }
+  if (text.startsWith('حظر ')) {
+    const id = text.slice(4).trim();
+    await env.DB.prepare('INSERT OR IGNORE INTO blacklist(app_id) VALUES(?)').bind(id).run();
+    await env.DB.prepare('DELETE FROM queue WHERE app_id=?').bind(id).run();
+    return tg(env, 'sendMessage', { chat_id: msg.chat.id, text: `🚫 حُظر التطبيق ${id}.` });
+  }
+  // إضافة قسم: «قسم <uuid التصنيف> <الاسم> [العدد]»
+  let m = text.match(/^قسم\s+([a-f0-9-]{8,})\s+(.+?)(?:\s+(\d+))?$/i);
+  if (m) {
+    const catUuid = m[1], name = m[2].trim(), quota = safeCount(m[3], 5);
+    const key = 'c' + catUuid.replace(/-/g, '').slice(0, 8);
+    const ord = ((await env.DB.prepare('SELECT MAX(ord) mx FROM sections').first()).mx || 0) + 1;
+    await env.DB.prepare('INSERT OR REPLACE INTO sections(key,name,path,quota,enabled,ord) VALUES(?,?,?,?,1,?)')
+      .bind(key, `📦 ${name}`, catUuid, quota, ord).run();
+    return tg(env, 'sendMessage', { chat_id: msg.chat.id, text: `✅ أُضيف قسم «${name}» (${quota}/ساعة). سيبدأ بالمسح التالي.` });
+  }
+  // عدد مخصّص لقسم: «عدد <key> <رقم>»
+  m = text.match(/^عدد\s+([a-z0-9]+)\s+(\d+)$/);
+  if (m && await sectionExists(env, m[1])) {
+    await env.DB.prepare('UPDATE sections SET quota=? WHERE key=?').bind(safeCount(m[2], 5), m[1]).run();
+    return tg(env, 'sendMessage', { chat_id: msg.chat.id, text: `✅ عدد ${m[1]} = ${safeCount(m[2], 5)}/ساعة.` });
+  }
+}
+
+// ملخص يومي للمالك (يُرسل مرة عند أول تِكّة بعد الساعة 21 بتوقيت السعودية)
+async function maybeDailySummary(env) {
+  if ((await getSetting(env, 'daily_summary', '0')) !== '1') return;
+  const t = nowSec() + KSA_OFFSET;
+  const hour = new Date(t * 1000).getUTCHours();
+  if (hour < 21) return;                          // بعد 9 مساءً السعودية
+  const today = ksaDay();
+  if ((await getSetting(env, 'daily_last', '')) === today) return; // مرة واحدة اليوم
+  await setSetting(env, 'daily_last', today);
+  const secs = await loadSections(env, false);
+  let lines = [];
+  for (const s of secs) {
+    const c = (await env.DB.prepare('SELECT COUNT(*) c FROM published WHERE section=? AND published_day=?').bind(s.key, today).first()).c;
+    lines.push(`${s.name}: ${c}`);
+  }
+  const total = (await env.DB.prepare('SELECT COUNT(*) c FROM published WHERE published_day=?').bind(today).first()).c;
+  const errs = (await env.DB.prepare("SELECT COUNT(*) c FROM log WHERE kind='error' AND ts >= ?").bind(nowSec() - 86400).first()).c;
+  // عدّاد مشتركي كل قناة
+  let subsLines = [];
+  for (const c of ((await env.DB.prepare('SELECT chat_id,name,username FROM channels WHERE enabled=1').all()).results || [])) {
+    const cnt = await getSubscriberCount(env, c.username || c.chat_id);
+    if (cnt != null) subsLines.push(`👥 ${c.name}: ${cnt}`);
+  }
+  const subsLine = subsLines.length ? '\n\n' + subsLines.join('\n') : '';
+  await notifyOwners(env, `<b>📊 ملخص اليوم (${today})</b>\n\nنُشر إجمالاً: ${total}${subsLine}\n\n${lines.join('\n')}\n\n⚠️ أخطاء: ${errs}`);
+}
+
+// عدد مشتركي قناة محدّدة (ident = @username أو chat_id) — null إذا تعذّر
+async function getSubscriberCount(env, ident) {
+  ident = ident || env.TG_CHANNEL || await getSetting(env, 'channel', '');
+  if (!ident) return null;
+  try {
+    const r = await tg(env, 'getChatMemberCount', { chat_id: ident });
+    return (r && r.ok && typeof r.result === 'number') ? r.result : null;
+  } catch { return null; }
+}
+
+// مالك قناة (telegram id) — للتوجيه؛ null = غير محدّد (يذهب لكل الملّاك)
+async function channelOwner(env, chatId) {
+  const r = await env.DB.prepare('SELECT owner FROM channels WHERE chat_id=?').bind(chatId).first();
+  return r && r.owner ? r.owner : null;
+}
+// تنبيه خاص بقناة: يذهب لمالكها فقط (إن حُدّد)، وإلا لكل الملّاك
+async function notifyChannelOwner(env, chatId, text, extra = {}) {
+  const o = await channelOwner(env, chatId);
+  if (o) await tg(env, 'sendMessage', { chat_id: o, parse_mode: 'HTML', text, ...extra });
+  else await notifyOwners(env, text, extra);
+}
+
+// سجّل عدد اليوم بالتاريخ (JSON بالإعدادات) — إدخال واحد/يوم، نحتفظ بآخر 30 يوماً
+async function recordSubsSnapshot(env, count) {
+  const today = ksaDay();
+  let hist = [];
+  try { hist = JSON.parse(await getSetting(env, 'subs_history', '[]')) || []; } catch { hist = []; }
+  hist = hist.filter(e => e && e.d !== today);
+  hist.push({ d: today, c: count });
+  hist = hist.slice(-30);
+  await setSetting(env, 'subs_history', JSON.stringify(hist));
+  return hist;
+}
+
+// مراقبة يومية للمشتركين — لكل قناة مفعّلة على حدة، والتنبيه يذهب لمالك القناة (أو الكل إن غير محدّد)
+async function maybeSubsWatch(env) {
+  const today = ksaDay();
+  if ((await getSetting(env, 'subs_watch_day', '')) === today) return;   // مرة واحدة باليوم
+  const chans = (await env.DB.prepare('SELECT chat_id, name, username FROM channels WHERE enabled=1').all()).results || [];
+  const step = 500;
+  let any = false;
+  for (const c of chans) {
+    const count = await getSubscriberCount(env, c.username || c.chat_id);
+    if (count == null) continue;
+    any = true;
+    // سجل تاريخي لكل قناة (مفتاح مستقل)
+    const hKey = 'subs_hist_' + c.chat_id;
+    let hist = [];
+    try { hist = JSON.parse(await getSetting(env, hKey, '[]')) || []; } catch { hist = []; }
+    const prevEntry = hist.filter(e => e.d !== today).slice(-1)[0];
+    const prev = prevEntry ? prevEntry.c : 0;
+    hist = hist.filter(e => e.d !== today); hist.push({ d: today, c: count }); hist = hist.slice(-30);
+    await setSetting(env, hKey, JSON.stringify(hist));
+    // 📉 هبوط
+    if (prev && (prev - count) >= 10) {
+      await notifyChannelOwner(env, c.chat_id, `📉 <b>هبوط بقناة ${H(c.name)}</b>\n\nنقص ${prev - count} مشترك اليوم (من ${prev} إلى ${count}).\nراجع آخر منشوراتك.`);
+    }
+    // 🎉 معلم (كل 500)
+    const mKey = 'subs_mile_' + c.chat_id;
+    const lastM = parseInt(await getSetting(env, mKey, '0'), 10) || 0;
+    const crossed = Math.floor(count / step) * step;
+    if (lastM === 0) {
+      await setSetting(env, mKey, crossed);                            // خط أساس بلا احتفال رجعي
+    } else if (crossed > lastM) {
+      await setSetting(env, mKey, crossed);
+      await notifyChannelOwner(env, c.chat_id, `🎉 <b>مبروك!</b>\n\nقناة ${H(c.name)} وصلت <b>${crossed}</b> مشترك 🚀`);
+    }
+  }
+  if (any) await setSetting(env, 'subs_watch_day', today);
+}
+
+// تنبيه «النشر متوقف»: نظام يعمل + طابور فيه منتظرون + ما نُشر شي من 6 ساعات (مرة واحدة حتى يعود)
+async function maybeHealthCheck(env) {
+  if (await getSetting(env, 'enabled', '1') !== '1') return;                 // متوقف يدوياً = طبيعي
+  const pausedUntil = parseInt(await getSetting(env, 'paused_until', '0'), 10) || 0;
+  if (pausedUntil && nowSec() < pausedUntil) return;                        // موقوف مؤقتاً = طبيعي
+  // احسب المنتظرين في الأقسام المفعّلة فقط (قسم موقّف به منتظرون = وضع مقصود، لا إنذار)
+  const enabledKeys = (await loadSections(env, true)).map(s => s.key);
+  if (!enabledKeys.length) return;
+  const ph = enabledKeys.map(() => '?').join(',');
+  const pending = (await env.DB.prepare(`SELECT COUNT(*) c FROM queue WHERE status='pending' AND section IN (${ph})`).bind(...enabledKeys).first()).c;
+  if (!pending) return;                                                     // ما فيه شي ينتظر = طبيعي
+  const last = parseInt(await getSetting(env, 'last_publish_ts', '0'), 10) || 0;
+  if (!last) return;                                                        // لم ينشر بعد أصلاً = لا إنذار كاذب
+  const since = nowSec() - last;
+  if (since < 6 * 3600) return;                                             // نُشر مؤخراً = تمام
+  if (await getSetting(env, 'health_alerted', '0') === '1') return;         // نبّهنا مسبقاً
+  await setSetting(env, 'health_alerted', '1');
+  await notifyOwners(env, `🔴 <b>تنبيه: النشر متوقف</b>\n\nصار ${fmtDur(since)} وما نُشر ولا تطبيق، والطابور فيه ${pending} منتظر.\n\nالأسباب المحتملة:\n• اشتراكك بموقع أحمد انتهى\n• مشكلة بجيت هَب أو تلقرام\n\nافتح «🧠 لوحتي» ← 📊 التقرير لتشوف آخر خطأ.`);
+}
+
+// تقرير أسبوعي (كل جمعة بعد 9 مساءً السعودية، مرة واحدة)
+async function maybeWeeklySummary(env) {
+  const d = new Date((nowSec() + KSA_OFFSET) * 1000);
+  if (d.getUTCDay() !== 5 || d.getUTCHours() < 21) return;                  // الجمعة بعد 9م
+  const today = ksaDay();
+  if ((await getSetting(env, 'weekly_last', '')) === today) return;
+  await setSetting(env, 'weekly_last', today);
+  const weekAgo = ksaDay(nowSec() - 6 * 86400);
+  const total = (await env.DB.prepare('SELECT COUNT(*) c FROM published WHERE published_day >= ?').bind(weekAgo).first()).c;
+  const secs = await loadSections(env, false);
+  const lines = [];
+  let topName = '—', topC = -1;
+  for (const s of secs) {
+    const c = (await env.DB.prepare('SELECT COUNT(*) c FROM published WHERE section=? AND published_day >= ?').bind(s.key, weekAgo).first()).c;
+    lines.push(`${s.name}: ${c}`);
+    if (c > topC) { topC = c; topName = s.name; }
+  }
+  const errs = (await env.DB.prepare("SELECT COUNT(*) c FROM log WHERE kind='error' AND ts >= ?").bind(nowSec() - 7 * 86400).first()).c;
+  let subsLines = [];
+  for (const c of ((await env.DB.prepare('SELECT chat_id,name,username FROM channels WHERE enabled=1').all()).results || [])) {
+    const cnt = await getSubscriberCount(env, c.username || c.chat_id);
+    if (cnt != null) subsLines.push(`👥 ${c.name}: ${cnt}`);
+  }
+  const subsLine = subsLines.length ? '\n\n' + subsLines.join('\n') : '';
+  await notifyOwners(env, `<b>🗓️ تقرير الأسبوع</b>\n\nنُشر إجمالاً: ${total}\nأنشط قسم: ${topName}${subsLine}\n\n${lines.join('\n')}\n\n⚠️ أخطاء الأسبوع: ${errs}`);
+}
+
+// تهيئة تلقائية لمرة واحدة: تسجيل القناة الرئيسية (كل الأقسام) + ضبط الويبهوك لاستقبال my_chat_member
+async function maybeBootstrap(env) {
+  if ((await getSetting(env, 'bootstrapped', '')) === '1') return;
+  const cnt = (await env.DB.prepare('SELECT COUNT(*) c FROM channels').first()).c;
+  if (!cnt && env.TG_CHANNEL) {
+    const ch = await getChat(env, env.TG_CHANNEL);
+    if (!ch) return;                                   // فشل getChat — نعيد المحاولة التِّكّة الجاية
+    const cid = String(ch.id);
+    await env.DB.prepare('INSERT OR IGNORE INTO channels(chat_id,name,username,enabled,added_at) VALUES(?,?,?,1,?)')
+      .bind(cid, ch.title || '', ch.username ? '@' + ch.username : '', nowSec()).run();
+    for (const s of await loadSections(env, false)) {
+      await env.DB.prepare('INSERT OR IGNORE INTO channel_sections(chat_id,section_key) VALUES(?,?)').bind(cid, s.key).run();
+    }
+  }
+  const wh = await tg(env, 'setWebhook', {
+    url: 'https://ahmad-auto-publisher.tamerapp-api.workers.dev/telegram',
+    secret_token: env.TG_WEBHOOK_SECRET,
+    allowed_updates: ['message', 'callback_query', 'my_chat_member'],
+  });
+  if (wh && wh.ok) await setSetting(env, 'bootstrapped', '1');
+}
+
+// ---------- المُوجّه ----------
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+
+    const readJson = async () => { try { return await request.json(); } catch { return null; } };
+
+    // بوت تلقرام — لازم توكن تلقرام السري (يمنع انتحال المالك عبر رقمه العام)
+    if (url.pathname === '/telegram' && request.method === 'POST') {
+      if (env.TG_WEBHOOK_SECRET &&
+          request.headers.get('X-Telegram-Bot-Api-Secret-Token') !== env.TG_WEBHOOK_SECRET) {
+        return new Response('forbidden', { status: 403 });
+      }
+      const u = await readJson();
+      if (!u) return new Response('ok');
+      // اكتشاف القنوات: عند تغيّر عضوية البوت بقناة — فقط لو المُغيِّر مالك
+      if (u.my_chat_member) {
+        const changer = u.my_chat_member.from ? String(u.my_chat_member.from.id) : '';
+        if ((await getOwners(env)).includes(changer)) await handleMyChatMember(env, u.my_chat_member);
+        return new Response('ok');
+      }
+      const from = u.callback_query ? u.callback_query.from : (u.message ? u.message.from : null);
+      const owners = await getOwners(env);
+      if (!from || !owners.includes(String(from.id))) return new Response('ok'); // للملّاك فقط
+      if (u.callback_query) await handleCallback(env, u.callback_query);
+      else if (u.message) await handleMessage(env, u.message);
+      return new Response('ok');
+    }
+
+    // قائمة الأقسام المفعّلة (يقرأها الماسح ليعرف ماذا يمسح)
+    if (url.pathname === '/sections' && request.method === 'GET') {
+      if (request.headers.get('x-secret') !== env.ENQUEUE_SECRET) return new Response('forbidden', { status: 403 });
+      const secs = await loadSections(env, true);
+      const pages = parseInt(await getSetting(env, 'scan_pages', '3'), 10) || 3;
+      return Response.json({ sections: secs.map(s => ({ key: s.key, path: s.path })), pages });
+    }
+
+    // الدايلب الفعّال (يسحبه العامل وقت الحقن بدل السر الثابت)
+    if (url.pathname === '/dylib' && request.method === 'GET') {
+      if (request.headers.get('x-secret') !== env.ENQUEUE_SECRET) return new Response('forbidden', { status: 403 });
+      const name = url.searchParams.get('name') || await getSetting(env, 'dylib_active', '');  // اسم محدّد أو الفعّال
+      if (!name) return new Response('', { status: 404 });
+      const data = await env.DYLIBS.get(name, 'arrayBuffer');
+      if (!data) return new Response('', { status: 404 });
+      return new Response(data, { headers: { 'content-type': 'application/octet-stream' } });
+    }
+
+    // تهيئة لمرة واحدة: تسجيل القناة الرئيسية (كل الأقسام) + ضبط الويبهوك ليستقبل my_chat_member
+    if (url.pathname === '/admin/setup' && request.method === 'POST') {
+      if (request.headers.get('x-secret') !== env.ENQUEUE_SECRET) return new Response('forbidden', { status: 403 });
+      let seeded = null;
+      const cnt = (await env.DB.prepare('SELECT COUNT(*) c FROM channels').first()).c;
+      if (!cnt && env.TG_CHANNEL) {
+        const ch = await getChat(env, env.TG_CHANNEL);
+        if (ch) {
+          const cid = String(ch.id);
+          await env.DB.prepare('INSERT OR IGNORE INTO channels(chat_id,name,username,enabled,added_at) VALUES(?,?,?,1,?)')
+            .bind(cid, ch.title || '', ch.username ? '@' + ch.username : '', nowSec()).run();
+          for (const s of await loadSections(env, false)) {
+            await env.DB.prepare('INSERT OR IGNORE INTO channel_sections(chat_id,section_key) VALUES(?,?)').bind(cid, s.key).run();
+          }
+          seeded = { chat_id: cid, name: ch.title };
+        }
+      }
+      const origin = new URL(request.url).origin;
+      const wh = await tg(env, 'setWebhook', {
+        url: origin + '/telegram',
+        secret_token: env.TG_WEBHOOK_SECRET,
+        allowed_updates: ['message', 'callback_query', 'my_chat_member'],
+      });
+      return Response.json({ seeded, webhook_ok: !!(wh && wh.ok) });
+    }
+
+    // جلسة بوت تلقرام المحفوظة (يعيد العامل استخدامها بدل تسجيل دخول كل مرة → لا FloodWait)
+    if (url.pathname === '/tgsession') {
+      if (request.headers.get('x-secret') !== env.ENQUEUE_SECRET) return new Response('forbidden', { status: 403 });
+      if (request.method === 'GET') {
+        return Response.json({ session: await getSetting(env, 'tg_session', '') });
+      }
+      if (request.method === 'POST') {
+        const b = await readJson();
+        if (b && typeof b.session === 'string') await setSetting(env, 'tg_session', b.session);
+        return Response.json({ ok: true });
+      }
+    }
+
+    // مصدر تلقرام (@AbodSyripa): كل ما يحتاجه القارئ في نداء واحد + تحديث آخر رسالة معالَجة
+    if (url.pathname === '/tgsource') {
+      if (request.headers.get('x-secret') !== env.ENQUEUE_SECRET) return new Response('forbidden', { status: 403 });
+      if (request.method === 'POST') {
+        const b = await readJson();
+        if (b && b.last_id != null) await setSetting(env, 'tg_last_id', String(b.last_id));
+        if (b && b.back_id != null) await setSetting(env, 'tg_back_id', String(b.back_id));
+        return Response.json({ ok: true });
+      }
+      // GET: الأهداف = كل القنوات المفعّلة مجمّعة بالدايلب (بلا تصفية قسم — مصدر واحد مختلط)
+      // كل قناة تحمل نصّها الخاص (footer)؛ الفارغ = النص العام
+      const active = await getSetting(env, 'dylib_active', '');
+      const rows = (await env.DB.prepare('SELECT chat_id, username, dylib, footer FROM channels WHERE enabled=1').all()).results || [];
+      const byDylib = {};
+      for (const r of rows) {
+        const dyl = r.dylib || active || '';
+        const ident = r.username || r.chat_id;
+        (byDylib[dyl] = byDylib[dyl] || []).push({ id: ident, footer: r.footer || '' });
+      }
+      let groups = Object.entries(byDylib).map(([dylib, channels]) => ({ dylib, channels }));
+      if (!groups.length && env.TG_CHANNEL) groups = [{ dylib: active, channels: [{ id: env.TG_CHANNEL, footer: '' }] }];
+      return Response.json({
+        enabled: (await getSetting(env, 'tg_source_enabled', '0')) === '1',
+        last_id: parseInt(await getSetting(env, 'tg_last_id', '0'), 10) || 0,
+        back_id: parseInt(await getSetting(env, 'tg_back_id', '0'), 10) || 0,   // مؤشّر الباكفل (0 = لا باكفل)
+        min_id: parseInt(await getSetting(env, 'tg_min_id', '0'), 10) || 0,     // حد الباكفل (2–3 أشهر)
+        limit: parseInt(await getSetting(env, 'tg_source_limit', '4'), 10) || 4,   // كم تطبيق كحد أقصى لكل تشغيل
+        footer: await getSetting(env, 'footer', ''),
+        reactions: await getSetting(env, 'reactions', '🔥,❤️'),
+        groups,
+      });
+    }
+
+    // إدخال تطبيقات من الماسح
+    if (url.pathname === '/enqueue' && request.method === 'POST') {
+      if (request.headers.get('x-secret') !== env.ENQUEUE_SECRET) return new Response('forbidden', { status: 403 });
+      const body = await readJson();
+      if (!body) return new Response('bad request', { status: 400 });
+      const added = await enqueueApps(env, body.section || 'updates', body.apps || []);
+      return Response.json({ ok: true, added });
+    }
+
+    // تأكيد نشر من العامل
+    if (url.pathname === '/published' && request.method === 'POST') {
+      if (request.headers.get('x-secret') !== env.ENQUEUE_SECRET) return new Response('forbidden', { status: 403 });
+      const body = await readJson();
+      if (!body || !isValidId(body.app_id)) return new Response('bad request', { status: 400 });
+      await markPublished(env, body.app_id, body.name, body.version);
+      return Response.json({ ok: true });
+    }
+
+    // فشل من العامل (يرجّع للطابور + تنبيه المالك)
+    if (url.pathname === '/failed' && request.method === 'POST') {
+      if (request.headers.get('x-secret') !== env.ENQUEUE_SECRET) return new Response('forbidden', { status: 403 });
+      const body = await readJson();
+      if (!body || !isValidId(body.app_id)) return new Response('bad request', { status: 400 });
+      const errMsg = String(body.error || '');
+      // تطبيق تالف (0 بايت) = تخطٍّ فوري بلا إعادة محاولة (لا يؤخّر الطابور)
+      const isDead = errMsg.includes('DEAD_APP');
+      // أكبر من حد تلقرام (2 جيجا) أو تحميل بطيء جداً = تخطٍّ فوري (بلا 3 محاولات) لكن مع تنبيه المالك مرة
+      // (الملف الضخم/المخنوق لا يخلص بمهلة الوظيفة، فإعادته 3 مرات تسدّ أنبوب النشر على باقي القنوات)
+      const isOversize = errMsg.includes('OVERSIZE') || errMsg.includes('SLOW_DL') || /file parts is invalid|entity too large|request entity too large|too big/i.test(errMsg);
+      const row = await env.DB.prepare('SELECT attempts FROM queue WHERE app_id=?').bind(body.app_id).first();
+      const attempts = (row ? (row.attempts || 0) : 0) + 1;
+      const giveUp = isDead || isOversize || attempts >= 3;  // تالف/كبير = فوراً، وإلا بعد 3 محاولات
+      await env.DB.prepare(`UPDATE queue SET status=?, attempts=? WHERE app_id=?`)
+        .bind(giveUp ? 'failed' : 'pending', attempts, body.app_id).run();
+      const reason = arErr(errMsg);   // سبب عربي موحّد (للسجل والتنبيه معاً)
+      await logEvent(env, 'error', `${isDead ? '☠️ تالف' : isOversize ? '📦 كبير' : 'فشل'} ${body.app_id}${(isDead || isOversize) ? '' : ` (محاولة ${attempts})`}: ${reason}`);
+      if ((attempts >= 3 || isOversize) && !isDead) {
+        const q = await env.DB.prepare('SELECT name FROM queue WHERE app_id=?').bind(body.app_id).first();
+        const nm = q && q.name ? q.name : body.app_id;
+        await notifyOwners(env, `⚠️ <b>تُخطّي: ${H(nm)}</b>\nالسبب: ${H(reason)}`, {
+          reply_markup: { inline_keyboard: [[{ text: `⛔ احظره نهائياً`, callback_data: `blk_${body.app_id}` }]] },
+        });
+      }
+      return Response.json({ ok: true });
+    }
+
+    if (url.pathname === '/') return new Response('ahmad-auto-publisher: alive');
+    return new Response('not found', { status: 404 });
+  },
+
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil((async () => {
+      await maybeBootstrap(env);
+      await tick(env);
+      await maybeHealthCheck(env);
+      await maybeSubsWatch(env);
+      await maybeDailySummary(env);
+      await maybeWeeklySummary(env);
+    })());
+  },
+};
