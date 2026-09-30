@@ -54,6 +54,7 @@ async function tg(env, method, payload) {
   return r.json();
 }
 const H = (s) => String(s ?? '').replace(/[<&>]/g, (c) => ({ '<': '&lt;', '&': '&amp;', '>': '&gt;' }[c]));
+const SEP = '\n━━━━━━━━━━━━\n';   // فاصل بريميوم أسود هادئ موحّد لكل الشاشات
 
 // الملّاك مخزّنون بجدول settings (تُعدَّل من البوت نفسه)؛ عند الفراغ نبدأ من سر OWNER_ID
 async function getOwners(env) {
@@ -143,10 +144,10 @@ async function sourceView(env) {
   const backId = parseInt(await getSetting(env, 'tg_back_id', '0'), 10) || 0;
   const minId = parseInt(await getSetting(env, 'tg_min_id', '0'), 10) || 0;
   const backfilling = backId && backId > minId;
-  const text = `<b>📥 مصدر التطبيقات</b>\n\n` +
+  const text = `<b>📥 مصدر التطبيقات</b>` + SEP +
     `الحالة: ${on ? '🟢 يعمل' : '⚪️ موقوف'}\n` +
     `كل تشغيل: ${limit} تطبيق (كل 10 دقائق)\n` +
-    `السحب التدريجي: ${backfilling ? '🟡 شغّال (يسحب القديم بالتدريج)' : '✅ منتهٍ — الجديد فقط'}\n\n` +
+    `السحب التدريجي: ${backfilling ? '🟡 شغّال (يسحب القديم بالتدريج)' : '✅ منتهٍ — الجديد فقط'}` + SEP +
     `<i>يقرأ القناة تلقائياً، يشيل بصمتهم، يحقن بصمتك، وينشر بقنواتك.</i>`;
   const kb = [
     [{ text: on ? '⏸️ إيقاف المصدر' : '▶️ تشغيل المصدر', callback_data: 'srctog' }],
@@ -389,12 +390,12 @@ async function panelMain(env) {
     : paused ? `⏸️ موقوف مؤقتاً (باقي ${fmtDur(pausedUntil - nowSec())})`
     : '🟢 يعمل';
   const text =
-    `<b>🧠 لوحة تحكم النشر</b>\n\n` +
+    `<b>🧠 لوحة تحكم النشر</b>` + SEP +
     `الحالة: ${statusLine}\n` +
     `النمط: ${mix ? '🔀 مخلوط' : '🗂️ مجمّع'}\n` +
-    `الإجمالي: ${total}/ساعة\n\n` +
+    `الإجمالي: ${total}/ساعة` + SEP +
     lines.join('\n') +
-    `\n\nنُشر اليوم: ${todayCount}`;
+    `\n\n📤 نُشر اليوم: <b>${todayCount}</b>`;
   const kb = [
     [{ text: enabled ? '⏸️ إيقاف' : '▶️ تشغيل', callback_data: 'toggle' }],
     [{ text: '🚀 نشر تطبيق فوراً', callback_data: 'pubnow' }],
@@ -510,7 +511,7 @@ async function handleCallback(env, cq) {
       const arrow = !prev ? '' : g > 0 ? ` (+${g} ▲)` : g < 0 ? ` (${g} ▼)` : '';
       lines.push(`👥 <b>${H(c.name)}</b>: ${cnt}${arrow}`);
     }
-    return edit(`<b>👥 مشتركو قنواتك</b>\n\n${lines.join('\n')}`, [[{ text: '🔄 تحديث', callback_data: 'subs' }], ...back]);
+    return edit(`<b>👥 مشتركو قنواتك</b>${SEP}${lines.join('\n')}`, [[{ text: '🔄 تحديث', callback_data: 'subs' }], ...back]);
   }
 
   if (data === 'report') {
@@ -520,7 +521,7 @@ async function handleCallback(env, cq) {
     const last = (await env.DB.prepare("SELECT msg FROM log WHERE kind='ok' ORDER BY id DESC LIMIT 5").all()).results;
     const lastTxt = last.map(r => `• ${H(r.msg)}`).join('\n') || '—';
     const errTxt = errs.length ? '\n\n⚠️ آخر أخطاء:\n' + errs.map(e => '• ' + H(e.msg)).join('\n') : '';
-    return edit(`<b>📊 التقرير</b>\n\nنُشر اليوم: ${today}\n\nآخر ما نُشر:\n${lastTxt}${errTxt}`, back);
+    return edit(`<b>📊 التقرير</b>${SEP}📤 نُشر اليوم: <b>${today}</b>${SEP}آخر ما نُشر:\n${lastTxt}${errTxt}`, back);
   }
 
   // 📈 التحليلات والأهداف: متابعون (+نمو) · نشر · مشاهدات · تفاعلات · أهداف
@@ -555,17 +556,18 @@ async function handleCallback(env, cq) {
     };
     const fmt = (n) => n > 0 ? `+${n} ▲` : n < 0 ? `${n} ▼` : '0';
     const text =
-      `<b>📈 التحليلات والأهداف</b>\n\n` +
+      `<b>📈 التحليلات والأهداف</b>` + SEP +
       `👥 <b>المتابعون:</b> ${haveSubs ? subs : '—'}\n` +
       `   • اليوم: ${fmt(gDay)}\n` +
-      `   • آخر ٧ أيام: ${fmt(g7)}\n\n` +
+      `   • آخر ٧ أيام: ${fmt(g7)}` + SEP +
       `📦 <b>النشر:</b>\n` +
       `   • اليوم: ${pubToday}\n` +
-      `   • الإجمالي: ${pubTotal}\n\n` +
+      `   • الإجمالي: ${pubTotal}` + SEP +
       `👁️ <b>مشاهدات اليوم:</b> ${vt.v} (على ${vt.p} منشور)\n` +
-      `🔥 <b>تفاعلات اليوم:</b> ${vt.r}\n` +
-      (vt.p ? `📊 متوسط المشاهدات لكل منشور: ${Math.round(vt.v / vt.p)}\n` : '') +
-      `\n🎯 <b>الأهداف:</b>\n` +
+      `🔥 <b>تفاعلات اليوم:</b> ${vt.r}` +
+      (vt.p ? `\n📊 متوسط المشاهدات لكل منشور: ${Math.round(vt.v / vt.p)}` : '') +
+      SEP +
+      `🎯 <b>الأهداف:</b>\n` +
       `   • متابعون: ${bar(subs, goalSubs)}\n` +
       `   • تطبيقات منشورة: ${bar(pubTotal, goalApps)}`;
     const kb = [
@@ -1071,7 +1073,7 @@ async function maybeDailySummary(env) {
     goalLines.push(`🎯 المتابعون: ${totSubs}/${goalSubs} (${Math.min(100, Math.round(totSubs / goalSubs * 100))}%)`);
   }
   const goalLine = goalLines.length ? '\n\n' + goalLines.join('\n') : '';
-  await notifyOwners(env, `<b>📊 ملخص اليوم (${today})</b>\n\nنُشر إجمالاً: ${total}${subsLine}${engLine}${goalLine}\n\n${lines.join('\n')}\n\n⚠️ أخطاء: ${errs}`);
+  await notifyOwners(env, `<b>📊 ملخص اليوم (${today})</b>${SEP}📤 نُشر إجمالاً: <b>${total}</b>${subsLine}${engLine}${goalLine}${SEP}${lines.join('\n')}${SEP}⚠️ أخطاء: ${errs}`);
 }
 
 // عدد مشتركي قناة محدّدة (ident = @username أو chat_id) — null إذا تعذّر
@@ -1212,7 +1214,7 @@ async function maybeBootstrap(env) {
 
 // ---------- المُوجّه ----------
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
     const readJson = async () => { try { return await request.json(); } catch { return null; } };
@@ -1234,8 +1236,13 @@ export default {
       const from = u.callback_query ? u.callback_query.from : (u.message ? u.message.from : null);
       const owners = await getOwners(env);
       if (!from || !owners.includes(String(from.id))) return new Response('ok'); // للملّاك فقط
-      if (u.callback_query) await handleCallback(env, u.callback_query);
-      else if (u.message) await handleMessage(env, u.message);
+      // عالج بالخلفية وردّ «ok» فوراً — استجابة الأزرار لحظية + لا يعيد تلقرام الطلب + لا يتجمّد بالضغط المكرر
+      ctx.waitUntil((async () => {
+        try {
+          if (u.callback_query) await handleCallback(env, u.callback_query);
+          else if (u.message) await handleMessage(env, u.message);
+        } catch (e) { console.log('[handler]', (e && e.stack) || e); }
+      })());
       return new Response('ok');
     }
 

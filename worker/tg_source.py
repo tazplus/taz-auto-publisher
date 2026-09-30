@@ -29,6 +29,13 @@ HDR = {"x-secret": SECRET}
 def brain_get():
     return requests.get(BRAIN + "/tgsource", headers=HDR, timeout=30).json()
 
+def brain_enabled():
+    """فحص سريع: هل النشر لا زال مفعّلاً؟ (لاحترام زر الإيقاف فوراً حتى وسط الجولة)."""
+    try:
+        return bool(requests.get(BRAIN + "/tgsource", headers=HDR, timeout=15).json().get("enabled", True))
+    except Exception:
+        return True   # عند تعذّر الفحص لا نوقف (الأمان: نكمل)
+
 def brain_set_state(**kw):
     """يحدّث مؤشّرات الحالة بالعقل (last_id للجديد، back_id للباكفل)."""
     try:
@@ -482,6 +489,8 @@ async def _run():
         done = 0
         # الجديد بالترتيب التصاعدي — ينشر كل واحد فوراً ويقدّم المؤشّر
         for m in sorted(new, key=lambda x: x.id):
+            if not brain_enabled():           # احترام زر الإيقاف فوراً حتى وسط الجولة
+                print("أُوقف النشر وسط الجولة — توقّف"); return
             try:
                 res = await asyncio.wait_for(
                     _process_one(client, m, "new", cfg_base, groups, reactions, footer),
@@ -502,6 +511,8 @@ async def _run():
                 traceback.print_exc(); print(f"[fail] tg{m.id} skipped: {str(e)[:200]}")
         # الباكفل بالترتيب التنازلي (الأحدث أولاً)
         for m in back:
+            if not brain_enabled():           # احترام زر الإيقاف فوراً حتى وسط الجولة
+                print("أُوقف النشر وسط الباكفل — توقّف"); return
             try:
                 res = await asyncio.wait_for(
                     _process_one(client, m, "back", cfg_base, groups, reactions, footer),
