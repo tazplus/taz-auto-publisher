@@ -1114,12 +1114,8 @@ async function maybeBootstrap(env) {
       await env.DB.prepare('INSERT OR IGNORE INTO channel_sections(chat_id,section_key) VALUES(?,?)').bind(cid, s.key).run();
     }
   }
-  const wh = await tg(env, 'setWebhook', {
-    url: 'https://ahmad-auto-publisher.tamerapp-api.workers.dev/telegram',
-    secret_token: env.TG_WEBHOOK_SECRET,
-    allowed_updates: ['message', 'callback_query', 'my_chat_member'],
-  });
-  if (wh && wh.ok) await setSetting(env, 'bootstrapped', '1');
+  // الويبهوك يُضبط عبر POST /admin/setup (بالـorigin الصحيح لهذا الـWorker) — لا URL مثبّت هنا
+  await setSetting(env, 'bootstrapped', '1');
 }
 
 // ---------- المُوجّه ----------
