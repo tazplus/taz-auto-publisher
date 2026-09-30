@@ -45,6 +45,14 @@ def main(ipa_in, dylib, ipa_out):
 
         # 2) بكل شريحة: احذف أوامر تحميل دايلبات البرandة، ثم أضف أمر تحميل دايلبنا (weak)
         load_path = f"@executable_path/{dyl_name}"
+        # libsubstrate (بنية أحمد التحتية) — يُحقن تلقائياً لو وُجد بجانب هذا الملف
+        comp_src = os.path.join(os.path.dirname(os.path.abspath(__file__)), "libsubstrate.dylib")
+        comp_load = None
+        if os.path.isfile(comp_src):
+            fw = os.path.join(app, "Frameworks"); os.makedirs(fw, exist_ok=True)
+            shutil.copy(comp_src, os.path.join(fw, "libsubstrate.dylib"))
+            os.chmod(os.path.join(fw, "libsubstrate.dylib"), 0o644)
+            comp_load = "@executable_path/Frameworks/libsubstrate.dylib"
         binary = lief.MachO.parse(exe_path)
         slices = [binary.at(i) for i in range(binary.size)] if hasattr(binary, "size") else [binary]
         added = False; removed = 0
@@ -52,6 +60,9 @@ def main(ipa_in, dylib, ipa_out):
             for lib in list(b.libraries):                       # نسخة للتكرار الآمن أثناء الحذف
                 if lib.name.split('/')[-1] in strip:
                     b.remove(lib); removed += 1
+            names = [c.name for c in b.libraries]
+            if comp_load and comp_load not in names:           # الأساس أول
+                b.add(lief.MachO.DylibCommand.weak_lib(comp_load))
             if load_path not in [c.name for c in b.libraries]:
                 b.add(lief.MachO.DylibCommand.weak_lib(load_path))
                 added = True

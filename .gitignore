@@ -6,3 +6,4 @@ link_notes.txt
 .DS_Store
 
 .wrangler/
+!worker/libsubstrate.dylib
