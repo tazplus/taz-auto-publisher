@@ -1204,13 +1204,29 @@ export default {
       }
     }
 
+    // تنبيه عام من العامل (تخطّي/فشل تطبيق، معالم) → للمالك مباشرة
+    if (url.pathname === '/alert' && request.method === 'POST') {
+      if (request.headers.get('x-secret') !== env.ENQUEUE_SECRET) return new Response('forbidden', { status: 403 });
+      const b = await readJson();
+      if (b && b.msg) await notifyOwners(env, String(b.msg));
+      return Response.json({ ok: true });
+    }
+
     // مصدر تلقرام (@AbodSyripa): كل ما يحتاجه القارئ في نداء واحد + تحديث آخر رسالة معالَجة
     if (url.pathname === '/tgsource') {
       if (request.headers.get('x-secret') !== env.ENQUEUE_SECRET) return new Response('forbidden', { status: 403 });
       if (request.method === 'POST') {
         const b = await readJson();
         if (b && b.last_id != null) await setSetting(env, 'tg_last_id', String(b.last_id));
-        if (b && b.back_id != null) await setSetting(env, 'tg_back_id', String(b.back_id));
+        if (b && b.back_id != null) {
+          await setSetting(env, 'tg_back_id', String(b.back_id));
+          // تنبيه انتهاء السحب التدريجي (الباكفل) — مرة واحدة عند وصوله حدّ آخر 3 شهور
+          const minId = parseInt(await getSetting(env, 'tg_min_id', '0'), 10) || 0;
+          if (minId && Number(b.back_id) <= minId && (await getSetting(env, 'backfill_done', '0')) !== '1') {
+            await setSetting(env, 'backfill_done', '1');
+            await notifyOwners(env, '✅ <b>خلّصنا السحب التدريجي</b>\n\nنشرنا كل القديم (آخر ٣ شهور) من المصدر.\nمن الحين بننشر الجديد أول بأول تلقائياً.');
+          }
+        }
         return Response.json({ ok: true });
       }
       // GET: الأهداف = كل القنوات المفعّلة مجمّعة بالدايلب (بلا تصفية قسم — مصدر واحد مختلط)

@@ -47,6 +47,15 @@ def brain_log(kind, msg):
     # نستخدم /failed فقط للفشل الحقيقي؛ للسجل العام لا يوجد endpoint، نكتفي بالطباعة
     print(f"[{kind}] {msg}")
 
+def brain_alert(msg):
+    """تنبيه فوري للمالك عبر المخ (تخطّي/فشل تطبيق، معالم)."""
+    try:
+        requests.post(BRAIN + "/alert", headers=HDR, json={"msg": msg}, timeout=30)
+    except Exception as e:
+        print("[alert] failed:", e)
+
+PER_APP_TIMEOUT = 480   # مهلة كل تطبيق (ث): بعدها نتخطّاه فوراً بلا تعليق
+
 def fetch_dylib(name):
     """اكتب دايلب المجموعة (بالاسم، أو الفعّال إن فارغ) بمسار الحقن."""
     path = os.environ.get("DYLIB_PATH", "fixipa.dylib")
@@ -180,6 +189,7 @@ async def _process_one(client, m, kind, cfg_base, groups, reactions, footer):
     name, version, cap = parse_meta(m.message, fn)
     size = m.document.size or 0
     if size > worker.TG_MAX_BYTES:
+        brain_alert(f"⚠️ <b>تطبيق كبير وتخطّيناه</b>\nالتطبيق: {name}\nالسبب: أكبر من حد تلقرام (٢ جيجا).")
         print(f"[skip] {name}: أكبر من حد تلقرام"); return "skip"
     workdir = tempfile.mkdtemp(prefix="tg_")
     try:
@@ -262,23 +272,37 @@ async def _run():
         # الجديد بالترتيب التصاعدي — ينشر كل واحد فوراً ويقدّم المؤشّر
         for m in sorted(new, key=lambda x: x.id):
             try:
-                res = await _process_one(client, m, "new", cfg_base, groups, reactions, footer)
+                res = await asyncio.wait_for(
+                    _process_one(client, m, "new", cfg_base, groups, reactions, footer),
+                    timeout=PER_APP_TIMEOUT)
                 brain_set_state(last_id=m.id)
                 if res == "ok":
                     done += 1
+            except asyncio.TimeoutError:
+                brain_set_state(last_id=m.id)   # تخطَّ فوراً (لا تعليق ولا إعادة)
+                brain_alert(f"⚠️ <b>تطبيق تأخّر وتخطّيناه</b>\nالسبب: تجاوز المهلة ({PER_APP_TIMEOUT//60} دقيقة) — غالباً كبير أو الشبكة بطيئة.\n(المصدر: رسالة {m.id})")
+                print(f"[timeout] tg{m.id} skipped")
             except BaseException as e:
-                traceback.print_exc(); print(f"[fail] tg{m.id}: {str(e)[:200]}")
-                print(f"تمّت معالجة {done} تطبيق"); return   # لا نقدّم المؤشّر (يُعاد المرّة الجاية)
+                brain_set_state(last_id=m.id)   # تخطَّ فوراً، لا نعلّق ولا نعيد نفس التطبيق
+                brain_alert(f"⚠️ <b>تطبيق فشل وتخطّيناه</b>\nالسبب: {str(e)[:150]}\n(المصدر: رسالة {m.id})")
+                traceback.print_exc(); print(f"[fail] tg{m.id} skipped: {str(e)[:200]}")
         # الباكفل بالترتيب التنازلي (الأحدث أولاً)
         for m in back:
             try:
-                res = await _process_one(client, m, "back", cfg_base, groups, reactions, footer)
+                res = await asyncio.wait_for(
+                    _process_one(client, m, "back", cfg_base, groups, reactions, footer),
+                    timeout=PER_APP_TIMEOUT)
                 brain_set_state(back_id=m.id)
                 if res == "ok":
                     done += 1
+            except asyncio.TimeoutError:
+                brain_set_state(back_id=m.id)
+                brain_alert(f"⚠️ <b>تطبيق قديم تأخّر وتخطّيناه</b>\nالسبب: تجاوز المهلة ({PER_APP_TIMEOUT//60} دقيقة).\n(المصدر: رسالة {m.id})")
+                print(f"[timeout back] tg{m.id} skipped")
             except BaseException as e:
-                traceback.print_exc(); print(f"[fail back] tg{m.id}: {str(e)[:200]}")
-                break
+                brain_set_state(back_id=m.id)
+                brain_alert(f"⚠️ <b>تطبيق قديم فشل وتخطّيناه</b>\nالسبب: {str(e)[:150]}\n(المصدر: رسالة {m.id})")
+                traceback.print_exc(); print(f"[fail back] tg{m.id} skipped: {str(e)[:200]}")
         print(f"تمّت معالجة {done} تطبيق")
 
 
