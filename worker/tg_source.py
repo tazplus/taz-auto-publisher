@@ -201,7 +201,7 @@ def _sanitize_src(src):
         t = re.sub(r'@\w+', '', ln)                         # شِل أي معرّف @
         t = re.sub(r'https?://\S+|t\.me/\S+', '', t)         # شِل الروابط
         if re.search(r'(?i)blatant|bodsy|syripa|ipaomtk|check0?ver|t\.me|telegram|قناة|تابعنا|اشترك|'
-                     r'modded\s*by|modified\s*by|cracked|by\s+\w+|developer|مطوّر|المطور|بواسطة', t):
+                     r'(?:modded|modified|patched|cracked|signed|released)\s*by', t):
             continue                                         # سطر برandة/مصدر → احذفه كاملاً
         t = t.strip()
         if t:
@@ -220,6 +220,7 @@ def _build_prompt(name, cap):
         "2) desc: وصف عربي فاخر قصير جداً (سطر إلى سطرين) لوظيفة التطبيق، مبني على المعلومات "
         "المذكورة فقط لا غير.\n"
         "3) features: عرّب للعربية المميزات/التغييرات المذكورة في نص المصدر بأسلوب جذاب ومهذّب. "
+        "يجب أن تكون features مصفوفة JSON من جُمل عربية، كل ميزة عنصر نصّي مستقل (وليست نصاً واحداً). "
         "ممنوع تماماً اختراع أي ميزة غير مذكورة، وممنوع الزيادة من عندك، وممنوع تعديل أو تضخيم "
         "أي ميزة. إذا لم يذكر المصدر مميزات واضحة فاكتب من 2 إلى 3 نقاط واقعية موجزة تصف وظيفة "
         "التطبيق الأساسية فقط بلا مبالغة.\n"
@@ -230,7 +231,17 @@ def _build_prompt(name, cap):
 
 
 def _valid(o):
-    return o if (isinstance(o, dict) and o.get("name") and o.get("desc")) else None
+    if not (isinstance(o, dict) and o.get("name") and o.get("desc")):
+        return None
+    f = o.get("features")
+    if isinstance(f, list):
+        o["features"] = [str(x).strip() for x in f if str(x).strip()]
+    elif isinstance(f, str) and f.strip():
+        parts = [p.strip(" \u2022\u00b7-*\t") for p in re.split(r"[\n\r]+", f) if p.strip()]
+        o["features"] = parts if len(parts) >= 2 else [f.strip()]
+    else:
+        o["features"] = []
+    return o
 
 
 def _try_gemini(prompt):
@@ -331,7 +342,10 @@ def _format_caption(o, version):
     fixed = "\n".join([title, "", desc, "", "🔹 المميزات:", "", tail_ver, "", CLOSER])
     budget = CAPTION_LIMIT - _vlen(fixed)
     feats, used = [], 0
-    for f in (o.get("features") or [])[:6]:
+    _feats = o.get("features") or []
+    if isinstance(_feats, str):                         # حماية: لو رجع نصاً بدل قائمة لا تقسّمه حروفاً
+        _feats = [_feats]
+    for f in _feats[:6]:
         f = str(f).strip().lstrip("•-*·").strip()
         if not f:
             continue
