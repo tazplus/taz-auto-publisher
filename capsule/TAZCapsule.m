@@ -56,7 +56,7 @@ static BOOL gPending = NO;
 }
 + (instancetype)shared { static TAZCapsule *s; static dispatch_once_t t; dispatch_once(&t,^{ s=[TAZCapsule new]; }); return s; }
 
-// إقلاع آمن (زي أحمد): +load بعد تجهيز الأطر، بلا وصول UIKit مبكر، مع حماية كاملة
+// إقلاع آمن: +load بعد تجهيز الأطر، بلا وصول UIKit مبكر، مع حماية كاملة
 + (void)load{
   @autoreleasepool{
     gPending=YES;

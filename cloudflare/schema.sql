@@ -33,7 +33,7 @@ CREATE INDEX IF NOT EXISTS idx_pub_at  ON published(published_at);
 CREATE TABLE IF NOT EXISTS sections (
   key     TEXT PRIMARY KEY,                   -- updates | games | design | modded | cat<رقم>
   name    TEXT,                               -- الاسم المعروض بالبوت والقناة
-  path    TEXT,                               -- مسار صفحة أحمد (/last-app-update أو /category/N)
+  path    TEXT,                               -- معرّف/مسار القسم (غير مستخدم في مسار @blatants)
   quota   INTEGER DEFAULT 5,                  -- الحد الساعي للقسم (0 = موقّف)
   enabled INTEGER DEFAULT 1,                  -- 1 مفعّل | 0 موقّف
   ord     INTEGER DEFAULT 0                   -- ترتيب العرض

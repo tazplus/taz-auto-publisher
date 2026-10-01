@@ -23,13 +23,15 @@
 | `TG_BOT_TOKEN` | توكن البوت |
 | `OWNER_ID` | رقم حسابك بتلقرام (للوحة التحكم) |
 | `GH_TOKEN` | توكن قِثهب (fine-grained، صلاحية repository_dispatch) |
-| `GH_REPO` | `اسم-حسابك/ahmad-auto-publisher` |
+| `GH_REPO` | `tazplus/taz-auto-publisher` |
 | `ENQUEUE_SECRET` | كلمة سر تخترعها (نفسها بقِثهب) |
 
 ### في GitHub (Repository Secrets)
 | السر | القيمة |
 |---|---|
-| `AHMAD_EMAIL` / `AHMAD_PASSWORD` | دخولك لموقع أحمد |
+| `TG_USER_SESSION` / `TG_USER_API_ID` / `TG_USER_API_HASH` | جلسة القارئ (userbot) لقراءة @blatants |
+| `SOURCE_CHANNEL` | قناة المصدر `@blatants` |
+| `GEMINI_API_KEY` | مفتاح التعريب العربي (اختياري — يُسحب من المخ) |
 | `DYLIB_B64` | `base64 -i fixipa.dylib` (ناتج الأمر) |
 | `TG_API_ID` / `TG_API_HASH` | من my.telegram.org |
 | `TG_BOT_TOKEN` | نفس توكن البوت |
@@ -42,7 +44,7 @@
 
 ## خطوات النشر (نسوّيها سوا وقت الربط)
 
-1. **قاعدة البيانات:** `wrangler d1 create ahmad_publisher` → ننسخ الـ id في `wrangler.toml` → `wrangler d1 execute ahmad_publisher --file=schema.sql`
+1. **قاعدة البيانات:** `wrangler d1 create taz_publisher` → ننسخ الـ id في `wrangler.toml` → `wrangler d1 execute taz_publisher --file=schema.sql`
 2. **نشر العقل:** `wrangler deploy` → يعطينا `BRAIN_URL`
 3. **أسرار العقل:** `wrangler secret put <name>` لكل واحد فوق
 4. **ويبهوك البوت:** نوجّه بوت تلقرام على `BRAIN_URL/telegram`
