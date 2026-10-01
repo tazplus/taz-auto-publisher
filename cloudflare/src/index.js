@@ -93,6 +93,32 @@ async function dispatchWorker(env, app, footer, groups) {
   return res.ok;
 }
 
+// ---------- إيقاف فوري: إلغاء أي نسخة قارئ شغّالة الآن على GitHub ----------
+// يُستدعى لحظة الضغط على «إيقاف المصدر» حتى يتوقف النشر خلال ثوانٍ بدل انتظار نهاية الدفعة.
+async function cancelReaderRuns(env) {
+  const H = {
+    'Authorization': `Bearer ${env.GH_TOKEN}`,
+    'Accept': 'application/vnd.github+json',
+    'User-Agent': 'taz-auto-publisher',
+  };
+  let cancelled = 0;
+  try {
+    for (const status of ['in_progress', 'queued']) {
+      const r = await fetch(
+        `https://api.github.com/repos/${env.GH_REPO}/actions/workflows/telegram.yml/runs?status=${status}&per_page=30`,
+        { headers: H });
+      if (!r.ok) continue;
+      const runs = ((await r.json()).workflow_runs) || [];
+      for (const run of runs) {
+        const c = await fetch(`https://api.github.com/repos/${env.GH_REPO}/actions/runs/${run.id}/cancel`,
+          { method: 'POST', headers: H });
+        if (c.ok) cancelled++;
+      }
+    }
+  } catch (e) { /* فشل الإلغاء لا يكسر الإيقاف — الحالة أصلاً صارت «موقوف» */ }
+  return cancelled;
+}
+
 // مجموعات النشر لقسم: [{dylib, channels:[ident,...]}] — القنوات مجمّعة حسب دايلبها
 // (قنوات نفس الدايلب = مجموعة واحدة تُحقن مرة؛ إن لم تُضبط قنوات → الرئيسية بالدايلب الفعّال)
 async function targetGroups(env, sectionKey) {
@@ -889,6 +915,12 @@ async function handleCallback(env, cq) {
   if (data === 'srctog') {
     const cur = (await getSetting(env, 'tg_source_enabled', '0')) === '1';
     await setSetting(env, 'tg_source_enabled', cur ? '0' : '1');
+    if (cur) {                                   // كان شغّالاً → الآن إيقاف: ألغِ أي نسخة شغّالة فوراً
+      const n = await cancelReaderRuns(env);
+      const v = await sourceView(env);
+      const note = n > 0 ? `\n\n🛑 تم إيقاف ${n} نسخة شغّالة فوراً.` : '\n\n🛑 موقوف — ما فيه نسخة شغّالة حالياً.';
+      return edit(v.text + note, v.kb);
+    }
     const v = await sourceView(env);
     return edit(v.text, v.kb);
   }

@@ -30,11 +30,14 @@ def brain_get():
     return requests.get(BRAIN + "/tgsource", headers=HDR, timeout=30).json()
 
 def brain_enabled():
-    """فحص سريع: هل النشر لا زال مفعّلاً؟ (لاحترام زر الإيقاف فوراً حتى وسط الجولة)."""
-    try:
-        return bool(requests.get(BRAIN + "/tgsource", headers=HDR, timeout=15).json().get("enabled", True))
-    except Exception:
-        return True   # عند تعذّر الفحص لا نوقف (الأمان: نكمل)
+    """فحص سريع: هل النشر لا زال مفعّلاً؟ (لاحترام زر الإيقاف فوراً حتى وسط الجولة).
+    نحاول مرتين؛ وإن تعذّر التأكد نهائياً نوقف احتياطاً — زر الإيقاف أهم من استمرار النشر."""
+    for _ in range(2):
+        try:
+            return bool(requests.get(BRAIN + "/tgsource", headers=HDR, timeout=15).json().get("enabled", True))
+        except Exception:
+            time.sleep(2)
+    return False   # تعذّر التأكد بعد محاولتين → نوقف (الجولة القادمة تكمّل لو كان شغّالاً)
 
 def brain_set_state(**kw):
     """يحدّث مؤشّرات الحالة بالعقل (last_id للجديد، back_id للباكفل)."""
